@@ -29,10 +29,7 @@ pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
         smooth_1euro(input, cutoff, beta, output);
         0
     });
-    match result {
-        Ok(code) => code,
-        Err(_) => -2,
-    }
+    result.unwrap_or(-2)
 }
 
 fn smooth_1euro(input: &[f32], cutoff: f32, beta: f32, output: &mut [f32]) {

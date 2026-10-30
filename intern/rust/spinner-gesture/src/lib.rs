@@ -32,10 +32,7 @@ pub unsafe extern "C" fn spinner_gesture_classify(
             GestureKind::None as i32
         }
     });
-    match result {
-        Ok(k) => k,
-        Err(_) => -1,
-    }
+    result.unwrap_or(-1)
 }
 
 #[cfg(test)]

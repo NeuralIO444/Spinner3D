@@ -17,10 +17,7 @@ pub unsafe extern "C" fn spinner_pressure_eval(
         let u = 1.0 - t;
         u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3
     });
-    match result {
-        Ok(v) => v,
-        Err(_) => t,
-    }
+    result.unwrap_or(t)
 }
 
 #[cfg(test)]

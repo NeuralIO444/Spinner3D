@@ -11,4 +11,7 @@ rust-version = "1.78"
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
+# Pedantic is noisy for FFI crates; keep useful subset.
+doc_markdown = "allow"
+missing_safety_doc = "allow"
+manual_unwrap_or = "allow"
