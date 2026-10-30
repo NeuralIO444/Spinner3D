@@ -89,7 +89,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn golden_constant_input() {
         // Constant input should stay constant.
         let input = vec![1.0_f32, 2.0, 1.0, 2.0, 1.0, 2.0];
@@ -115,8 +114,8 @@ mod tests {
 
     #[test]
     fn rejects_small_out() {
-        let input = vec![0.0_f32; 4];
-        let mut output = vec![0.0_f32; 2];
+        let input = [0.0_f32; 4];
+        let mut output = [0.0_f32; 2];
         let code = unsafe {
             spinner_stroke_smooth_1euro(
                 input.as_ptr(),
@@ -131,6 +130,7 @@ mod tests {
         };
         assert_eq!(code, -7);
     }
+    #[test]
     fn rejects_overlap() {
         let mut buf = vec![0.0_f32; 4];
         let code = unsafe {
