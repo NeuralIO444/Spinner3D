@@ -21,6 +21,7 @@ from . import shelf
 from . import workspace
 from . import navigate
 from . import popup
+from . import phase2
 
 
 @persistent
@@ -34,6 +35,7 @@ def register():
     shelf.register()
     navigate.register()
     popup.register()
+    phase2.register()
     keymap.register()
     workspace.register()
     bpy.app.handlers.depsgraph_update_post.append(on_workspace_change)
@@ -43,6 +45,7 @@ def unregister():
     bpy.app.handlers.depsgraph_update_post.remove(on_workspace_change)
     workspace.unregister()
     keymap.unregister()
+    phase2.unregister()
     popup.unregister()
     navigate.unregister()
     shelf.unregister()

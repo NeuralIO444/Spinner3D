@@ -37,6 +37,13 @@ class SPINNER_SCULPTZ_PT_shelf(Panel):
         row.operator("spinner_sculptz.isolate", text="Isolate")
         row.operator("spinner_sculptz.show_all", text="Show All")
 
+        layout.separator()
+        layout.label(text="Phase 2")
+        layout.operator("spinner_sculptz.polypaint_toggle", icon="VPAINT_HLT")
+        layout.operator("spinner_sculptz.add_layer", icon="SHAPEKEY_DATA")
+        layout.operator("spinner_sculptz.project_detail", icon="MOD_DATA_TRANSFER")
+        layout.operator("spinner_sculptz.retopo", icon="MOD_REMESH")
+
 
 classes = (SPINNER_SCULPTZ_PT_shelf,)
 
