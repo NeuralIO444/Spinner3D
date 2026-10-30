@@ -12,6 +12,8 @@ pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
     len: u32,
     cutoff: f32,
     beta: f32,
+    d_cutoff: f32,
+    dt: f32,
     out: *mut f32,
 ) -> i32 {
     let result = catch_unwind(|| {
@@ -31,7 +33,7 @@ pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
         if (points as usize) < out_end && (out as usize) < points_end {
             return -5;
         }
-        if !cutoff.is_finite() || cutoff <= 0.0 || !beta.is_finite() || beta < 0.0 {
+        if !cutoff.is_finite() || cutoff <= 0.0 || !beta.is_finite() || beta < 0.0 || !d_cutoff.is_finite() || d_cutoff <= 0.0 || !dt.is_finite() || dt <= 0.0 {
             return -6;
         }
         let input = unsafe { std::slice::from_raw_parts(points, n) };
@@ -39,13 +41,13 @@ pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
         if input.iter().any(|v| !v.is_finite()) {
             return -6;
         }
-        smooth_1euro(input, cutoff, beta, output);
+        smooth_1euro(input, cutoff, beta, d_cutoff, dt, output);
         0
     });
     result.unwrap_or(-2)
 }
 
-fn smooth_1euro(input: &[f32], cutoff: f32, beta: f32, output: &mut [f32]) {
+fn smooth_1euro(input: &[f32], cutoff: f32, beta: f32, d_cutoff: f32, dt: f32, output: &mut [f32]) {
     if input.is_empty() {
         return;
     }
@@ -55,15 +57,15 @@ fn smooth_1euro(input: &[f32], cutoff: f32, beta: f32, output: &mut [f32]) {
     let mut prev_dy = 0.0_f32;
     output[0] = prev_x;
     output[1] = prev_y;
-    let dt = 1.0_f32;
     let a_base = alpha(dt, cutoff);
+    let a_d = alpha(dt, d_cutoff);
     for i in 1..(input.len() / 2) {
         let x = input[i * 2];
         let y = input[i * 2 + 1];
         let dx = (x - prev_x) / dt;
         let dy = (y - prev_y) / dt;
-        let edx = a_base * dx + (1.0 - a_base) * prev_dx;
-        let edy = a_base * dy + (1.0 - a_base) * prev_dy;
+        let edx = a_d * dx + (1.0 - a_d) * prev_dx;
+        let edy = a_d * dy + (1.0 - a_d) * prev_dy;
         let speed = (edx * edx + edy * edy).sqrt();
         let cutoff_d = cutoff + beta * speed;
         let a = alpha(dt, cutoff_d);
@@ -97,6 +99,8 @@ mod tests {
                 (input.len() / 2) as u32,
                 1.0,
                 0.0,
+                1.0,
+                1.0 / 60.0,
                 output.as_mut_ptr(),
             )
         };
@@ -107,7 +111,7 @@ mod tests {
     fn rejects_overlap() {
         let mut buf = vec![0.0_f32; 4];
         let code = unsafe {
-            spinner_stroke_smooth_1euro(buf.as_ptr(), 2, 1.0, 0.0, buf.as_mut_ptr())
+            spinner_stroke_smooth_1euro(buf.as_ptr(), 2, 1.0, 0.0, 1.0, 1.0 / 60.0, buf.as_mut_ptr())
         };
         assert_eq!(code, -5);
     }

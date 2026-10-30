@@ -18,15 +18,13 @@ pub extern "C" fn spinner_gesture_classify(
     tap_timeout_ms: f32,
 ) -> i32 {
     catch_unwind(|| {
-        if pressed == 0 {
-            return GestureKind::None as i32;
-        }
         if !moved_px.is_finite() || !time_ms.is_finite() {
             return -1;
         }
         if moved_px >= drag_threshold_px {
             GestureKind::Drag as i32
-        } else if time_ms < tap_timeout_ms {
+        } else if pressed == 0 && time_ms < tap_timeout_ms {
+            // Tap only on release
             GestureKind::Tap as i32
         } else {
             GestureKind::None as i32

@@ -5,6 +5,7 @@
 
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -13,7 +14,7 @@ fn main() -> ExitCode {
         eprintln!("usage: spinner-assets <manifest.json>");
         return ExitCode::from(2);
     }
-    match validate(&args[1]) {
+    match validate(Path::new(&args[1])) {
         Ok(()) => ExitCode::from(0),
         Err(e) => {
             eprintln!("validation failed: {e}");
@@ -22,12 +23,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn validate(path: &str) -> Result<(), String> {
-    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    if !text.contains("\"brushes\"") {
-        return Err("missing brushes key".into());
+fn validate(path: &Path) -> Result<(), String> {
+    let meta = fs::metadata(path).map_err(|e| e.to_string())?;
+    if meta.len() > 16 * 1024 * 1024 {
+        return Err("file too large".into());
     }
-    Ok(())
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    match v.get("brushes") {
+        Some(serde_json::Value::Array(_)) => Ok(()),
+        Some(_) => Err("brushes must be an array".into()),
+        None => Err("missing brushes key".into()),
+    }
 }
 
 #[cfg(test)]
@@ -39,6 +46,13 @@ mod tests {
     fn rejects_missing_key() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         write!(f, r#"{{"other":[]}}"#).unwrap();
-        assert!(validate(f.path().to_str().unwrap()).is_err());
+        assert!(validate(f.path()).is_err());
+    }
+
+    #[test]
+    fn accepts_valid() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(f, r#"{{"brushes":[{{"name":"Move"}}]}}"#).unwrap();
+        assert!(validate(f.path()).is_ok());
     }
 }
