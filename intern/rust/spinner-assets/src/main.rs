@@ -1,4 +1,4 @@
-//! CLI that builds and validates the Spinner3D brush pack / shelf JSON.
+//! CLI that builds and validates the `Spinner3D` brush pack / shelf JSON.
 //!
 //! Usage: spinner-assets <manifest.json>
 //! Exits 0 on success, non-zero on validation failure.

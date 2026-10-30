@@ -12,10 +12,7 @@ use std::panic::catch_unwind;
 /// conditions; any panic is caught and converted to an error code.
 #[no_mangle]
 pub extern "C" fn spinner_hello() -> i32 {
-    match catch_unwind(|| 0x5350_494E) {
-        Ok(v) => v,
-        Err(_) => -1,
-    }
+    catch_unwind(|| 0x5350_494E).unwrap_or(-1)
 }
 
 #[cfg(test)]
