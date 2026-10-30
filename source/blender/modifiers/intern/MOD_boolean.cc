@@ -485,6 +485,18 @@ static Mesh *non_float_boolean_mesh(BooleanModifierData *bmd,
   Mesh *result = geometry::boolean::mesh_boolean(
       meshes, transforms, material_remaps, op_params, solver, nullptr, &error);
 
+  /* SPINNER3D: Manifold default with Exact fallback on non-manifold input. */
+  if (result == nullptr && solver == geometry::boolean::Solver::Manifold &&
+      error.type == geometry::boolean::BooleanErrorType::NonManifold)
+  {
+    BKE_modifier_set_error(ctx->object,
+                           (ModifierData *)bmd,
+                           "Manifold solver failed on non-manifold input; falling back to Exact");
+    error = {};
+    result = geometry::boolean::mesh_boolean(
+        meshes, transforms, material_remaps, op_params, geometry::boolean::Solver::MeshArr, nullptr, &error);
+  }
+
   if (error.type != geometry::boolean::BooleanErrorType::NoError) {
     if (error.type == geometry::boolean::BooleanErrorType::NonManifold) {
       if (!error.non_manifold_mesh_indices.is_empty()) {

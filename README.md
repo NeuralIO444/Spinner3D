@@ -1,38 +1,38 @@
-<!--
-Keep this document short & concise,
-linking to external resources instead of including content in-line.
-See 'release/text/readme.html' for the end user read-me.
--->
+# Spinner3D
 
-Blender
-=======
+Spinner3D is a hard-surface-oriented build of the Blender 5.3 codebase (GPL-3).
 
-Blender is the free and open source 3D creation suite.
-It supports the entirety of the 3D pipeline—modeling, rigging, animation, simulation, rendering, compositing,
-motion tracking and video editing.
+It keeps the core Blender engine and adds a small set of Python tools and recommended open-source extensions so hard-surface workflows (booleans, bevel stacks, quad remesh, constraint sketching) are available with minimal core changes.
 
-![Blender screenshot](https://code.blender.org/wp-content/uploads/2018/12/springrg.jpg "Blender screenshot")
+## What is different from upstream Blender
 
-Project Pages
--------------
+- **Hard-surface operator** (`scripts/startup/spinner/hardsurface.py`): one-click Bevel (angle) + Weighted Normal + Smooth by Angle stack that is idempotent.
+- **Manifold as preferred boolean solver** (planned small change in `MOD_boolean.cc` with Exact fallback).
+- **Bundled / recommended open-source extensions** (see `THIRD_PARTY.md`):
+  - Bool Tool (GPL-3)
+  - CAD Sketcher + py-slvs (GPL-3)
+  - QRemeshify / QuadWild (GPL-3)
+- **Hard Surface workspace** preset (matcap, cavity, wireframe overlay, vertex/edge/midpoint snapping).
 
-- [Main Website](https://www.blender.org)
-- [Reference Manual](https://docs.blender.org/manual/en/latest/index.html)
-- [User Community](https://www.blender.org/community/)
+## Build
 
-Development
------------
+Follow the standard Blender build instructions:
 
-- [Build Instructions](https://developer.blender.org/docs/handbook/building_blender/)
-- [Code Review & Bug Tracker](https://projects.blender.org)
-- [Developer Forum](https://devtalk.blender.org)
-- [Developer Documentation](https://developer.blender.org/docs/)
+https://developer.blender.org/docs/handbook/building_blender/
 
+```bash
+git clone https://github.com/NeuralIO444/Spinner3D.git
+cd Spinner3D
+git checkout spinner/hardsurface-v1
+make update
+make
+```
 
-License
--------
+## Branch plan
 
-Blender as a whole is licensed under the GNU General Public License, Version 3.
-Individual files may have a different but compatible license.
+- `main` — tracks upstream Blender HEAD (currently `191de40e`).
+- `spinner/hardsurface-v1` — hard-surface integration work. All changes land here via PRs. Do not push directly to `main`.
 
-See [blender.org/about/license](https://www.blender.org/about/license) for details.
+## License
+
+Spinner3D as a whole is GPL-3. Individual third-party components keep their own compatible licenses. See `THIRD_PARTY.md`.

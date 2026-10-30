@@ -3913,7 +3913,7 @@ static void rna_def_modifier_boolean(BlenderRNA *brna)
 
   prop = RNA_def_property(srna, "solver", PROP_ENUM, PROP_NONE);
   RNA_def_property_enum_items(prop, prop_solver_items);
-  RNA_def_property_enum_default(prop, eBooleanModifierSolver_Mesh_Arr);
+  RNA_def_property_enum_default(prop, eBooleanModifierSolver_Manifold); /* SPINNER3D: Manifold default */
   RNA_def_property_ui_text(prop, "Solver", "Method for calculating booleans");
   RNA_def_property_update(prop, 0, "rna_Modifier_update");
 

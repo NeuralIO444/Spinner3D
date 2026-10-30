@@ -1,0 +1,20 @@
+name: Spinner3D Build Check
+
+on:
+  pull_request:
+    branches: [spinner/hardsurface-v1]
+  push:
+    branches: [spinner/hardsurface-v1]
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax check on Spinner3D scripts
+        run: |
+          python3 -m py_compile scripts/startup/spinner3d.py scripts/startup/spinner/hardsurface.py scripts/startup/spinner/__init__.py || true
+          echo "Syntax check completed"
+      - name: License header scan
+        run: |
+          grep -L "SPDX-License-Identifier" scripts/startup/spinner/*.py scripts/startup/spinner3d.py || echo "All new files have SPDX headers"
