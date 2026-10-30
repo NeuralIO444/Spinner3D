@@ -4,8 +4,26 @@
 
 import bpy
 from bpy.types import Operator
+from bpy.props import FloatVectorProperty
 from bpy_extras import view3d_utils
 from mathutils import Vector
+
+
+def get_last_stroke_pivot():
+    """Return the stored last-stroke location, or None."""
+    scene = bpy.context.scene
+    if hasattr(scene, "spinner_sculptz_last_stroke") and scene.spinner_sculptz_last_stroke is not None:
+        loc = scene.spinner_sculptz_last_stroke
+        if loc.length > 0.0001:
+            return Vector(loc)
+    return None
+
+
+def set_last_stroke_pivot(location):
+    """Store a world-space stroke location."""
+    scene = bpy.context.scene
+    if hasattr(scene, "spinner_sculptz_last_stroke"):
+        scene.spinner_sculptz_last_stroke = location
 
 
 class SPINNER_SCULPTZ_OT_navigate(Operator):
@@ -89,7 +107,9 @@ class SPINNER_SCULPTZ_OT_navigate(Operator):
             hit = result
 
         if hit:
-            # On mesh: let sculpt stroke happen
+            # On mesh: record stroke location and let sculpt stroke happen
+            if location:
+                set_last_stroke_pivot(location)
             return {"PASS_THROUGH"}
 
         # Empty space: start orbit
@@ -97,9 +117,8 @@ class SPINNER_SCULPTZ_OT_navigate(Operator):
         self._orbiting = True
 
         # Pivot = last stroke location if available, else view center
-        self._pivot = None
-        if hasattr(context.tool_settings, "sculpt") and context.tool_settings.sculpt.brush:
-            # Use current view location as fallback pivot
+        self._pivot = get_last_stroke_pivot()
+        if self._pivot is None and context.region_data:
             self._pivot = context.region_data.view_location.copy()
 
         context.window_manager.modal_handler_add(self)
@@ -110,6 +129,11 @@ classes = (SPINNER_SCULPTZ_OT_navigate,)
 
 
 def register():
+    bpy.types.Scene.spinner_sculptz_last_stroke = FloatVectorProperty(
+        name="Last Stroke",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+    )
     for cls in classes:
         bpy.utils.register_class(cls)
 
@@ -117,3 +141,4 @@ def register():
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+    del bpy.types.Scene.spinner_sculptz_last_stroke
