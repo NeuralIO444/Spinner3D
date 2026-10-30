@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn golden_constant_input() {
         // Constant input should stay constant.
-        let input = vec![1.0_f32, 2.0, 1.0, 2.0, 1.0, 2.0];
+        let input = [1.0_f32, 2.0, 1.0, 2.0, 1.0, 2.0];
         let mut output = vec![0.0_f32; input.len()];
         let code = unsafe {
             spinner_stroke_smooth_1euro(
