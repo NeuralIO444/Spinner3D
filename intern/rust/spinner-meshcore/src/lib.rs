@@ -9,12 +9,14 @@ use std::panic::catch_unwind;
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct HalfEdge {
     vert: u32,
     next: u32,
     twin: u32,
 }
 
+#[allow(dead_code)]
 struct Mesh {
     verts: Vec<[f32; 3]>,
     edges: Vec<HalfEdge>,
