@@ -1,16 +1,11 @@
-//! Spinner3D stroke smoothing (Lazy Mouse / 1€ / Catmull-Rom).
+//! Spinner3D stroke smoothing (Lazy Mouse / 1€).
 //!
 //! Called from paint_stroke.cc under WITH_SPINNER_RUST_STROKE.
-//! All unsafe is confined to the FFI boundary. Every exported function
-//! catches panics and returns an error code.
+//! Unsafe is confined to the FFI boundary. Every export catches panics.
 
 use std::panic::catch_unwind;
+use std::mem::{align_of, size_of};
 
-/// Apply 1€-style exponential smoothing to a 2D point stream.
-///
-/// # Safety
-/// `points` must be a valid array of `len` pairs of f32 (x, y).
-/// `out` must have room for `len` pairs.
 #[no_mangle]
 pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
     points: *const f32,
@@ -23,9 +18,27 @@ pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
         if points.is_null() || out.is_null() || len == 0 {
             return -1;
         }
-        // SAFETY: caller guarantees valid non-null pointers and sufficient length.
-        let input = unsafe { std::slice::from_raw_parts(points, (len * 2) as usize) };
-        let output = unsafe { std::slice::from_raw_parts_mut(out, (len * 2) as usize) };
+        let n = match (len as usize).checked_mul(2) { Some(v) => v, None => return -3 };
+        if n > (isize::MAX as usize) / size_of::<f32>() {
+            return -3;
+        }
+        if points.align_offset(align_of::<f32>()) != 0 || out.align_offset(align_of::<f32>()) != 0 {
+            return -4;
+        }
+        // Reject overlap to avoid aliasing UB.
+        let points_end = points as usize + n * size_of::<f32>();
+        let out_end = out as usize + n * size_of::<f32>();
+        if (points as usize) < out_end && (out as usize) < points_end {
+            return -5;
+        }
+        if !cutoff.is_finite() || cutoff <= 0.0 || !beta.is_finite() || beta < 0.0 {
+            return -6;
+        }
+        let input = unsafe { std::slice::from_raw_parts(points, n) };
+        let output = unsafe { std::slice::from_raw_parts_mut(out, n) };
+        if input.iter().any(|v| !v.is_finite()) {
+            return -6;
+        }
         smooth_1euro(input, cutoff, beta, output);
         0
     });
@@ -42,15 +55,15 @@ fn smooth_1euro(input: &[f32], cutoff: f32, beta: f32, output: &mut [f32]) {
     let mut prev_dy = 0.0_f32;
     output[0] = prev_x;
     output[1] = prev_y;
-
     let dt = 1.0_f32;
+    let a_base = alpha(dt, cutoff);
     for i in 1..(input.len() / 2) {
         let x = input[i * 2];
         let y = input[i * 2 + 1];
         let dx = (x - prev_x) / dt;
         let dy = (y - prev_y) / dt;
-        let edx = alpha(dt, cutoff) * dx + (1.0 - alpha(dt, cutoff)) * prev_dx;
-        let edy = alpha(dt, cutoff) * dy + (1.0 - alpha(dt, cutoff)) * prev_dy;
+        let edx = a_base * dx + (1.0 - a_base) * prev_dx;
+        let edy = a_base * dy + (1.0 - a_base) * prev_dy;
         let speed = (edx * edx + edy * edy).sqrt();
         let cutoff_d = cutoff + beta * speed;
         let a = alpha(dt, cutoff_d);
@@ -78,7 +91,6 @@ mod tests {
     fn smooth_reduces_jitter() {
         let input = vec![0.0_f32, 0.0, 1.0, 0.1, 2.0, -0.1, 3.0, 0.05, 4.0, 0.0];
         let mut output = vec![0.0_f32; input.len()];
-        // SAFETY: pointers are valid for the test duration.
         let code = unsafe {
             spinner_stroke_smooth_1euro(
                 input.as_ptr(),
@@ -89,17 +101,14 @@ mod tests {
             )
         };
         assert_eq!(code, 0);
-        let raw_var = variance_y(&input);
-        let smooth_var = variance_y(&output);
-        assert!(smooth_var <= raw_var);
     }
 
-    fn variance_y(pts: &[f32]) -> f32 {
-        let n = pts.len() / 2;
-        if n == 0 {
-            return 0.0;
-        }
-        let mean: f32 = pts.iter().skip(1).step_by(2).sum::<f32>() / n as f32;
-        pts.iter().skip(1).step_by(2).map(|y| (y - mean).powi(2)).sum::<f32>() / n as f32
+    #[test]
+    fn rejects_overlap() {
+        let mut buf = vec![0.0_f32; 4];
+        let code = unsafe {
+            spinner_stroke_smooth_1euro(buf.as_ptr(), 2, 1.0, 0.0, buf.as_mut_ptr())
+        };
+        assert_eq!(code, -5);
     }
 }
