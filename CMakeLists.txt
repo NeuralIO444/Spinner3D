@@ -1333,6 +1333,8 @@ When requirements for a build option are not met, error instead of disabling the
 option(WITH_SPINNER_RUST "Build Spinner3D Rust modules via Corrosion" OFF)
 option(WITH_SPINNER_RUST_STROKE "Use Rust 1€ smoother in paint strokes" OFF)
 option(WITH_SPINNER_RUST_MESHCORE "Use Rust half-edge mesh core" OFF)
+option(WITH_SPINNER_RUST_REMESH "Use Rust remesh" OFF)
+option(WITH_SPINNER_RUST_REPAIR "Use Rust mesh repair" OFF)
 mark_as_advanced(WITH_SPINNER_RUST)
 
 if(NOT WITH_BLENDER AND NOT WITH_CYCLES_STANDALONE AND NOT WITH_CYCLES_HYDRA_RENDER_DELEGATE)
