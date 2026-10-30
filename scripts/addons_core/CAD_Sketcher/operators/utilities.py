@@ -1,0 +1,274 @@
+import logging
+
+import bpy
+from bpy.types import Context, Operator
+
+from ..declarations import BLENDER_SELECT_TOOL, GizmoGroups, WorkSpaceTools
+from ..drawing import selection
+from ..model.sketch_ref import get_active_sketch
+from ..utilities.curve_data import get_uuid, has_uuid_field, refresh_curve_geometry
+from ..utilities.preferences import get_prefs
+
+logger = logging.getLogger(__name__)
+
+
+def select_invert(context: Context):
+    sketch = get_active_sketch(context)
+    if not sketch or not sketch.target_object or not sketch.target_object.data:
+        return
+
+    curve_data = sketch.target_object.data
+    n = len(curve_data.curves)
+    if not has_uuid_field(curve_data, "curve_id"):
+        return
+
+    for i in range(n):
+        cid = get_uuid(curve_data, "curve_id", i)
+        if not cid:
+            continue
+        if cid in selection.selected:
+            selection.selected.remove(cid)
+        else:
+            selection.selected.append(cid)
+
+
+def select_extend(context: Context):
+    sketch = get_active_sketch(context)
+    if not sketch or not sketch.target_object or not sketch.target_object.data:
+        return False
+
+    cd = sketch.target_object.data
+    n = len(cd.curves)
+    type_attr = cd.attributes.get("sketch_type")
+    if not has_uuid_field(cd, "curve_id") or not type_attr:
+        return False
+
+    from ..model.constants import SketchCurveType
+
+    selected = set(selection.selected)
+    to_add = set()
+
+    for i in range(n):
+        cid = get_uuid(cd, "curve_id", i)
+        if not cid:
+            continue
+        ctype = type_attr.data[i].value
+        sp = get_uuid(cd, "start_point_id", i)
+        ep = get_uuid(cd, "end_point_id", i)
+        cp = get_uuid(cd, "center_point_id", i)
+        rel_ids = {r for r in (sp, ep, cp) if r}
+
+        if ctype == SketchCurveType.POINT:
+            # Point selected → select segments referencing it
+            if cid in selected:
+                for j in range(n):
+                    j_cid = get_uuid(cd, "curve_id", j)
+                    j_sp = get_uuid(cd, "start_point_id", j)
+                    j_ep = get_uuid(cd, "end_point_id", j)
+                    j_cp = get_uuid(cd, "center_point_id", j)
+                    if cid in (j_sp, j_ep, j_cp):
+                        to_add.add(j_cid)
+        else:
+            # Segment selected → select its points
+            if cid in selected:
+                to_add.update(rel_ids)
+            # Segment has a selected point → select the segment
+            elif rel_ids & selected:
+                to_add.add(cid)
+
+    # Follow coincident constraints
+    sketch = get_active_sketch(context)
+    coincident = sketch.constraints.coincident if sketch else []
+    for c in coincident:
+        c1, c2 = getattr(c, "curve_id_1", ""), getattr(c, "curve_id_2", "")
+        if c1 in selected and c2:
+            to_add.add(c2)
+        if c2 in selected and c1:
+            to_add.add(c1)
+
+    new = to_add - selected
+    for cid in new:
+        selection.selected.append(cid)
+    return len(new) > 0
+
+
+# NOTE: The draw handler has to be registered before this has any effect, currently it's possible that
+# entities are first created with an entity that was hovered in the previous state
+# Not sure if it's possible to force draw handlers...
+# Also note that a running modal operator might prevent redraws, avoid returning running_modal
+def ignore_hover(ref_or_id):
+    """Add a curve_id to the ignore list. Accepts CurveRef, curve_id int, or entity."""
+    from ..model.curve_ref import CurveRef
+
+    ignore_list = selection.ignore_list
+    if isinstance(ref_or_id, CurveRef):
+        ignore_list.append(ref_or_id.curve_id)
+    elif isinstance(ref_or_id, (int, str)):
+        ignore_list.append(ref_or_id)
+    else:
+        # Legacy entity — use slvs_index
+        ignore_list.append(ref_or_id.slvs_index)
+
+
+def get_hovered(context: Context, *types):
+    """Get the hovered CurveRef if it matches one of the accepted types.
+
+    Types can be CurveRef subclasses (PointRef, LineRef, etc.) or legacy
+    entity classes (SlvsPoint2D, SlvsLine2D, etc.).
+    """
+    from ..model.curve_ref import curve_ref
+
+    hover_id = selection.hover
+    if not hover_id:
+        return None
+
+    sketch = get_active_sketch(context)
+    if not sketch:
+        return None
+
+    ref = curve_ref(sketch, hover_id)
+    if not ref.valid:
+        return None
+
+    return ref if curve_ref_matches(ref, types) else None
+
+
+def curve_ref_matches(ref, types):
+    """Whether a CurveRef is one of ``types`` (CurveRef classes or legacy entity classes)."""
+    from ..model.curve_ref import ArcRef, CircleRef, LineRef, PointRef
+    from ..model.types import SlvsArc, SlvsCircle, SlvsLine2D, SlvsPoint2D
+
+    _type_map = {
+        SlvsPoint2D: PointRef,
+        SlvsLine2D: LineRef,
+        SlvsArc: ArcRef,
+        SlvsCircle: CircleRef,
+    }
+
+    for t in types:
+        is_curve_ref_type = isinstance(t, type) and issubclass(
+            t, (PointRef, LineRef, ArcRef, CircleRef)
+        )
+        if is_curve_ref_type and isinstance(ref, t):
+            return True
+        mapped = _type_map.get(t)
+        if mapped and isinstance(ref, mapped):
+            return True
+    return False
+
+
+SMOOTHVIEW_FACTOR = 0
+
+
+def align_view(rv3d, mat_start, mat_end):
+
+    global SMOOTHVIEW_FACTOR
+    SMOOTHVIEW_FACTOR = 0
+    time_step = 0.01
+    increment = 0.01
+
+    def move_view():
+        global SMOOTHVIEW_FACTOR
+        SMOOTHVIEW_FACTOR += increment
+        mat = mat_start.lerp(mat_end, SMOOTHVIEW_FACTOR)
+        rv3d.view_matrix = mat
+
+        if SMOOTHVIEW_FACTOR < 1:
+            return time_step
+
+    bpy.app.timers.register(move_view)
+
+    # rv3d.view_distance = 6
+
+
+def switch_sketch_mode(
+    self, context: Context, to_sketch_mode: bool, *, is_3d: bool = False
+):
+    from ..workspacetools.manager import enter_sketch_mode, leave_sketch_mode
+
+    if to_sketch_mode:
+        enter_sketch_mode(is_3d=is_3d)
+        tool = context.workspace.tools.from_space_view3d_mode(context.mode)
+        if tool.widget != GizmoGroups.Preselection:
+            bpy.ops.wm.tool_set_by_id(name=WorkSpaceTools.Select)
+        return True
+
+    bpy.ops.wm.tool_set_by_id(name=BLENDER_SELECT_TOOL)
+    leave_sketch_mode()
+    return True
+
+
+def activate_sketch(context: Context, sketch_obj, operator: Operator):
+    """Activate a sketch (Curves object) or deactivate (pass None)."""
+    from ..model.sketch_ref import Sketch, get_active_sketch, set_active_sketch
+
+    space_data = context.space_data
+
+    current = get_active_sketch(context)
+    if sketch_obj is not None and current and current.target_object == sketch_obj:
+        return {"CANCELLED"}
+
+    new_sketch = Sketch(sketch_obj) if sketch_obj is not None else None
+    sketch_mode = new_sketch is not None
+    switch_sketch_mode(
+        self=operator,
+        context=context,
+        to_sketch_mode=sketch_mode,
+        is_3d=bool(new_sketch and new_sketch.is_3d),
+    )
+
+    last = current
+    set_active_sketch(context, sketch_obj)
+
+    # A native 3D sketch deliberately keeps the user's current view: that view
+    # defines its temporary placement plane. Classic 2D sketches still align to
+    # their workplane according to the preference.
+    if get_prefs().use_align_view and not (new_sketch and new_sketch.is_3d):
+        bpy.ops.view3d.slvs_align_view(use_active=True)
+
+    # Hide objects
+    fade_objects = get_prefs().auto_hide_objects
+    if fade_objects:
+        space_data.shading.show_xray = sketch_mode
+
+    logger.debug("Activate: {}".format(sketch_obj))
+    context.area.tag_redraw()
+
+    if context.mode != "OBJECT":
+        return {"FINISHED"}
+
+    if last:
+        refresh_curve_geometry(last)
+
+    if sketch_obj is None and last:
+        select_result_ob(context, last)
+
+    return {"FINISHED"}
+
+
+def select_result_ob(context, sketch):
+    """Leave a sketch with what it made selected: its body, else its part.
+
+    The sketch object itself is source, hidden and not something to grab; the
+    body is the mesh the user sees and moves. A sketch from a file that has not
+    been updated yet has no body and still carries its own result.
+
+    A cutter's body is hidden while it cuts, and ``select_set`` on a hidden
+    object silently does nothing -- leaving a cut with the selection empty, and
+    with it the sidebar's idea of which part you are in. The part it belongs to
+    stands in for it, which is the thing you were editing anyway.
+    """
+    from ..utilities.body import body_of
+    from ..utilities.part import part_root_of
+
+    target_ob = sketch.target_object
+    bpy.ops.object.select_all(action="DESELECT")
+    if not target_ob:
+        return
+
+    ob = body_of(target_ob) or target_ob
+    if ob.hide_viewport or ob.hide_get():
+        ob = part_root_of(ob) or ob
+    if ob.name in context.view_layer.objects and not ob.hide_viewport:
+        ob.select_set(True)
+        context.view_layer.objects.active = ob

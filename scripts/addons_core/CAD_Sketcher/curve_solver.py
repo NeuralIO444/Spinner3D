@@ -1,0 +1,785 @@
+"""Solver that reads/writes native curve data directly.
+
+Builds solvespace entities from curve attributes (positions, sketch_type,
+start_point_id, end_point_id, center_point_id) and writes solved positions
+back to curve points. No Slvs* entity read/write needed for geometry.
+
+Structural entities (workplane, normal) still come from the entity system.
+Constraints still come from PropertyGroups (referencing entities for now).
+"""
+
+import logging
+import math
+
+import numpy as np
+from mathutils import Matrix as _Matrix
+from mathutils import Vector
+
+from .model.base_constraint import sketch_resolution
+from .model.constants import SketchCurveType
+from .model.curve_ref import published_curve_types
+from .utilities.constants import FULL_TURN, HALF_TURN
+from .utilities.curve_data import (
+    get_curve_index,
+    has_uuid_field,
+)
+from .utilities.workplane import ensure_workplane_empty
+
+logger = logging.getLogger(__name__)
+
+# slvs holds a single module-global system. Counting how often it is cleared
+# lets a solver tell whether the system it built is still the one loaded, so a
+# drag can keep re-solving it instead of rebuilding (see CurveSolver.drag_to).
+_sketch_generation = 0
+
+
+def _clear_sketch(solvesys) -> int:
+    """Clear the global slvs system and return the new generation."""
+    global _sketch_generation
+    solvesys.clear_sketch()
+    _sketch_generation += 1
+    return _sketch_generation
+
+
+def _stored_differs(current, new) -> bool:
+    """Whether writing ``new`` over ``current`` would change the stored floats.
+
+    Positions are float32 attributes, so the comparison is done at that precision
+    rather than against the solver's doubles (see ``_write_results``).
+    """
+    return bool(
+        (
+            np.asarray(new, dtype=np.float32) != np.asarray(current, dtype=np.float32)
+        ).any()
+    )
+
+
+def _bulk_curve_arrays(curve_data, type_attr):
+    """Per-curve type and first point index, plus every point position.
+
+    One foreach_get each instead of an RNA lookup per curve
+    (``type_attr.data[i].value``, ``curves[i].points[0].index``,
+    ``points[j].position``), which dominated building the solver system.
+    Positions come back as float32 rows, the attribute's own storage, so the
+    values match a per-point read exactly.
+    """
+    n = len(curve_data.curves)
+    types = np.zeros(n, dtype=np.int32)
+    type_attr.data.foreach_get("value", types)
+    first = np.zeros(n, dtype=np.int32)
+    curve_data.curves.foreach_get("first_point_index", first)
+    positions = np.zeros(len(curve_data.points) * 3, dtype=np.float32)
+    curve_data.points.foreach_get("position", positions)
+    return types.tolist(), first.tolist(), positions.reshape(-1, 3)
+
+
+class CurveSolver:
+    """Solver that operates on native curve data."""
+
+    group_fixed = 1
+    group_sketch = 3
+
+    def __init__(self, context, sketch):
+        self.context = context
+        self.sketch = sketch
+
+        import slvs
+
+        self.solvesys = slvs
+        self._generation = _clear_sketch(slvs)
+
+        self.ok = True
+        self.result = None
+
+        # Tweak state
+        self._tweak_curve_id = None
+        self._tweak_pos = None
+        # The curve a drag targets, kept even while a solve drops the pin (#584).
+        self._drag_curve_id = None
+        # The temporary drag point of the loaded system, if it has one.
+        self._drag_handle = None
+
+        # Mapping: curve_id → solvespace handle (for points)
+        self._point_handles = {}
+        # Mapping: curve_id → solvespace handle (for all entities)
+        self._entity_handles = {}
+        # For circle radius params
+        self._distance_params = {}
+        self._curve_types = {}
+
+    def tweak(self, curve_id, pos):
+        """Set the curve to be dragged to the given position."""
+        self._tweak_curve_id = curve_id
+        self._tweak_pos = pos
+        self._drag_curve_id = curve_id
+
+    def _init_workplane(self):
+        """Initialize the workplane from the workplane empty object.
+
+        Falls back to entity workplane if no empty exists yet.
+        """
+        if getattr(self.sketch, "is_3d", False):
+            self._wp_handle = self.solvesys.E_FREE_IN_3D
+            self._normal_handle = None
+            return
+
+        # Legacy entity sketches still mint their empty on first solve; native
+        # ones answer from their own plane.
+        ensure_workplane_empty(self.sketch)
+
+        if hasattr(self.sketch, "plane_matrix"):
+            mat = self.sketch.plane_matrix
+            origin_loc = mat.translation
+            quat = mat.to_quaternion()
+        elif hasattr(self.sketch, "wp") and self.sketch.wp:
+            origin_loc = self.sketch.wp.p1.location
+            quat = self.sketch.wp.nm.orientation
+        else:
+            # Default to XY plane at origin
+            from mathutils import Quaternion
+
+            origin_loc = (0.0, 0.0, 0.0)
+            quat = Quaternion()
+
+        origin_handle = self.solvesys.add_point_3d(self.group_fixed, *origin_loc)
+        normal_handle = self.solvesys.add_normal_3d(
+            self.group_fixed, quat.w, quat.x, quat.y, quat.z
+        )
+        wp_handle = self.solvesys.add_workplane(
+            self.group_fixed, origin_handle, normal_handle
+        )
+
+        if hasattr(self.sketch, "wp") and self.sketch.wp:
+            self.sketch.wp.p1.py_data = origin_handle
+            self.sketch.wp.nm.py_data = normal_handle
+            self.sketch.wp.py_data = wp_handle
+
+        self._wp_handle = wp_handle
+        self._normal_handle = normal_handle
+
+    def _init_geometry(self):
+        """Build solvespace entities from curve data."""
+        sketch = self.sketch
+        if not sketch.target_object or not sketch.target_object.data:
+            return
+
+        curve_data = sketch.target_object.data
+        n_curves = len(curve_data.curves)
+        if n_curves == 0:
+            return
+
+        type_attr = curve_data.attributes.get("sketch_type")
+
+        if not has_uuid_field(curve_data, "curve_id") or not type_attr:
+            return
+
+        wp = self._wp_handle
+        is_3d = getattr(sketch, "is_3d", False)
+
+        from .utilities.curve_data import read_uuid_list
+
+        # Bulk-read the id fields and flags once. Per-curve get_uuid() converts a
+        # 128-bit int id to a hex string with two attribute lookups each time, so
+        # calling it ~4x per curve dominated solve; one foreach_get + a single
+        # conversion pass per field is far cheaper (issue #342).
+        cid_list = read_uuid_list(curve_data, "curve_id")
+        sp_list = read_uuid_list(curve_data, "start_point_id")
+        ep_list = read_uuid_list(curve_data, "end_point_id")
+        cp_list = read_uuid_list(curve_data, "center_point_id")
+        fixed_attr = curve_data.attributes.get("fixed")
+        types, first_idx, positions = _bulk_curve_arrays(curve_data, type_attr)
+        self._curve_types = {cid: t for cid, t in zip(cid_list, types) if cid}
+        if fixed_attr:
+            fixed_flags = np.zeros(n_curves, dtype=np.bool_)
+            fixed_attr.data.foreach_get("value", fixed_flags)
+            fixed_flags = fixed_flags.tolist()
+        else:
+            fixed_flags = [False] * n_curves
+
+        # First pass: create all points
+        for curve_idx in range(n_curves):
+            ctype = types[curve_idx]
+            if ctype != SketchCurveType.POINT:
+                continue
+
+            cid = cid_list[curve_idx]
+            fixed = fixed_flags[curve_idx]
+            group = self.group_fixed if fixed else self.group_sketch
+
+            pos = positions[first_idx[curve_idx]].tolist()
+
+            if is_3d:
+                handle = self.solvesys.add_point_3d(group, *map(float, pos[:3]))
+            else:
+                u, v = float(pos[0]), float(pos[1])
+                handle = self.solvesys.add_point_2d(group, u, v, wp)
+            self._point_handles[cid] = handle
+            self._entity_handles[cid] = handle
+
+        # Second pass: create lines, arcs, circles
+        for curve_idx in range(n_curves):
+            ctype = types[curve_idx]
+            cid = cid_list[curve_idx]
+
+            if is_3d and ctype not in (SketchCurveType.POINT, SketchCurveType.LINE):
+                continue
+
+            if ctype == SketchCurveType.LINE:
+                sp_id = sp_list[curve_idx]
+                ep_id = ep_list[curve_idx]
+
+                p1_handle = self._point_handles.get(sp_id)
+                p2_handle = self._point_handles.get(ep_id)
+                if p1_handle and p2_handle:
+                    if is_3d:
+                        handle = self.solvesys.add_line_3d(
+                            self.group_sketch, p1_handle, p2_handle
+                        )
+                    else:
+                        handle = self.solvesys.add_line_2d(
+                            self.group_sketch, p1_handle, p2_handle, wp
+                        )
+                    self._entity_handles[cid] = handle
+
+            elif ctype == SketchCurveType.CIRCLE:
+                cp_id = cp_list[curve_idx]
+                ct_handle = self._point_handles.get(cp_id)
+                if ct_handle:
+                    # Get radius from curve geometry
+                    ct_pos = Vector(
+                        positions[first_idx[get_curve_index(sketch, cp_id)]].tolist()
+                    )
+                    edge_pos = Vector(positions[first_idx[curve_idx]].tolist())
+                    radius = (edge_pos - ct_pos).length
+
+                    dist_param = self.solvesys.add_distance(
+                        self.group_sketch, radius, wp
+                    )
+                    handle = self.solvesys.add_circle(
+                        self.group_sketch,
+                        self._normal_handle,
+                        ct_handle,
+                        dist_param,
+                        wp,
+                    )
+                    self._entity_handles[cid] = handle
+                    self._distance_params[cid] = dist_param
+
+            elif ctype == SketchCurveType.ARC:
+                cp_id = cp_list[curve_idx]
+                sp_id = sp_list[curve_idx]
+                ep_id = ep_list[curve_idx]
+
+                ct_handle = self._point_handles.get(cp_id)
+                p1_handle = self._point_handles.get(sp_id)
+                p2_handle = self._point_handles.get(ep_id)
+                if ct_handle and p1_handle and p2_handle:
+                    handle = self.solvesys.add_arc(
+                        self.group_sketch,
+                        self._normal_handle,
+                        ct_handle,
+                        p1_handle,
+                        p2_handle,
+                        wp,
+                    )
+                    self._entity_handles[cid] = handle
+
+        # Third pass: handle tweak (after all entities exist)
+        if (
+            not is_3d
+            and self._tweak_curve_id is not None
+            and self._tweak_pos is not None
+        ):
+            tweak_handle = self._entity_handles.get(self._tweak_curve_id)
+            if tweak_handle:
+                from .model.utilities import line_endpoint_positions, point_on_line
+
+                tw_u, tw_v = self._tweak_uv()
+                drag_pt = self.solvesys.add_point_2d(self.group_sketch, tw_u, tw_v, wp)
+                # For points: coincident point-to-point
+                # For lines/arcs/circles: coincident point-on-entity
+                endpoints = line_endpoint_positions(sketch, self._tweak_curve_id)
+                if endpoints:
+                    point_on_line(
+                        self.solvesys,
+                        self.group_sketch,
+                        drag_pt,
+                        tweak_handle,
+                        wp,
+                        *endpoints,
+                    )
+                else:
+                    self.solvesys.coincident(
+                        self.group_sketch, drag_pt, tweak_handle, wp
+                    )
+                self.solvesys.dragged(self.group_sketch, drag_pt, wp)
+                self._drag_handle = drag_pt
+
+    def _tweak_uv(self) -> tuple[float, float]:
+        """The tweak position in the sketch workplane's 2D coordinates."""
+        wp_mat = (
+            self.sketch.plane_matrix
+            if hasattr(self.sketch, "plane_matrix")
+            else _Matrix.Identity(4)
+        )
+        tw_u, tw_v, _ = wp_mat.inverted() @ self._tweak_pos
+        return tw_u, tw_v
+
+    def _resolution_sketch(self):
+        """``self.sketch`` as a Sketch accessor, for ``sketch_resolution``."""
+        sketch = self.sketch
+        if sketch is None or hasattr(sketch, "target_object"):
+            return sketch
+        from .model.sketch_ref import Sketch
+
+        return Sketch(sketch)
+
+    def _init_constraints(self):
+        """Initialize constraints using curve_id handles."""
+        sketch = self.sketch
+        sketch_obj = (
+            sketch.target_object if hasattr(sketch, "target_object") else sketch
+        )
+        wp = self._wp_handle
+
+        # Iterate constraints from the sketch's own data
+        if not sketch_obj or not sketch_obj.data:
+            return
+        sketch_constraints = sketch_obj.data.sketch_constraints
+
+        # solvespace constraint handle -> the SlvsConstraint that produced it, so
+        # a failed-constraint report from the solver can be mapped back to the
+        # user's constraints (a single constraint may add several handles).
+        self._constraint_by_handle = {}
+
+        for c in sketch_constraints.all:
+            group = self.group_sketch
+            c.failed = False
+
+            # Reference ("measure only") dimensions report a measurement; they must
+            # never drive the solver. Submitting them consumes a DOF and, when the
+            # quantity is already implied, forces REDUNDANT_OK and flags the group
+            # failed (issue #674). The pre-native-curves solver gated these in
+            # DimensionalConstraint.py_data(); restore the gate on the curve path.
+            if getattr(c, "is_reference", False):
+                continue
+
+            if getattr(sketch, "is_3d", False) and getattr(c, "type", "") != "DISTANCE":
+                # Free-3D sketches only support distance today. Flag anything else
+                # as failed so the UI marks it unsatisfied instead of silently
+                # ignoring it (a constraint reporting itself satisfied while doing
+                # nothing is worse than a visible error).
+                c.failed = True
+                continue
+
+            if not getattr(c, "curve_id_1", ""):
+                continue
+
+            if not c.accepts_curve_types(sketch):
+                c.failed = True
+                continue
+
+            try:
+                handles = c.create_slvs_data_from_curves(
+                    self.solvesys, self._entity_handles, wp, group
+                )
+            except Exception as e:
+                logger.debug(f"Constraint init failed: {c}, {e}")
+                continue
+
+            if handles is None:
+                continue
+            # A constraint add returns the solvespace constraint as a dict (its
+            # handle under 'h'); a few constraints add several, returning a list.
+            for item in handles if isinstance(handles, (list, tuple)) else (handles,):
+                h = item.get("h") if isinstance(item, dict) else item
+                if h:
+                    self._constraint_by_handle[h] = c
+
+    def _rebuild_arc_bezier(self, curve_data, curve_idx, center_pos, is_cyclic):
+        """Rebuild arc/circle bezier handles from solved point positions.
+
+        Replicates create_bezier_curve logic without entity references.
+        """
+        curve_slice = curve_data.curves[curve_idx]
+        n_points = curve_slice.points_length
+        first = curve_slice.points[0].index
+
+        # Collect point positions
+        positions = []
+        for i in range(n_points):
+            positions.append(Vector(curve_data.points[first + i].position[:2]))
+
+        center = Vector(center_pos[:2])
+
+        # Compute radius and angle
+        radius = (positions[0] - center).length
+        if radius < 1e-6:
+            return
+
+        if is_cyclic:
+            angle_per_segment = FULL_TURN / n_points
+            segment_count = n_points
+        else:
+            # Compute total angle from start to end
+            start_vec = positions[0] - center
+            end_vec = positions[-1] - center
+            from .utilities.math import range_2pi
+
+            total_angle = range_2pi(
+                math.atan2(end_vec[1], end_vec[0])
+                - math.atan2(start_vec[1], start_vec[0])
+            )
+            segment_count = n_points - 1
+            if segment_count == 0:
+                return
+            angle_per_segment = total_angle / segment_count
+
+        # Compute handle offset (standard bezier circle approximation)
+        n = FULL_TURN / angle_per_segment if angle_per_segment != 0 else 0
+        if n == 0:
+            return
+        q = (4 / 3) * math.tan(HALF_TURN / (2 * n))
+        base_offset = Vector((radius, q * radius))
+
+        # Compute midpoint positions for multi-segment arcs
+        if not is_cyclic and segment_count > 1:
+            start_angle = math.atan2(start_vec[1], start_vec[0])
+            for i in range(1, segment_count):
+                a = start_angle + angle_per_segment * i
+                positions[i] = center + Vector(
+                    (radius * math.cos(a), radius * math.sin(a))
+                )
+
+        # Build locations list
+        locations = list(positions)
+        if is_cyclic:
+            locations.append(locations[0])
+
+        # Set positions and handles
+        attrs = curve_data.attributes
+        hl = attrs.get("handle_left")
+        hr = attrs.get("handle_right")
+        if not hl or not hr:
+            return
+
+        bezier_indices = list(range(first, first + n_points))
+        if is_cyclic:
+            bezier_indices.append(first)
+
+        for seg in range(segment_count):
+            loc1, loc2 = locations[seg], locations[seg + 1]
+            b1_idx, b2_idx = bezier_indices[seg], bezier_indices[seg + 1]
+
+            coords = []
+            for i, loc in enumerate((loc1, loc2)):
+                pos = loc - center
+                angle = math.atan2(pos[1], pos[0])
+                offset = base_offset.copy()
+                if i == 1:
+                    offset[1] *= -1
+                offset.rotate(_Matrix.Rotation(angle, 2))
+                coords.append((center + offset).to_3d())
+
+            hr.data[b1_idx].vector = coords[0]
+            hl.data[b2_idx].vector = coords[1]
+            curve_data.points[b2_idx].position = loc2.to_3d()
+
+            if not is_cyclic:
+                if seg == 0:
+                    pos = loc1 - center
+                    angle = math.atan2(pos[1], pos[0])
+                    offset = base_offset.copy()
+                    offset[1] *= -1
+                    offset.rotate(_Matrix.Rotation(angle, 2))
+                    hl.data[b1_idx].vector = (center + offset).to_3d()
+                if seg == segment_count - 1:
+                    pos = loc2 - center
+                    angle = math.atan2(pos[1], pos[0])
+                    offset = base_offset.copy()
+                    offset.rotate(_Matrix.Rotation(angle, 2))
+                    hr.data[b2_idx].vector = (center + offset).to_3d()
+
+        # Set start point position
+        curve_data.points[first].position = positions[0].to_3d()
+
+    def _get_solved_point_position(self, curve_id):
+        """Get solved position for a point curve_id."""
+        handle = self._point_handles.get(curve_id)
+        if not handle:
+            return None
+        if getattr(self.sketch, "is_3d", False):
+            return tuple(
+                self.solvesys.get_param_value(handle["param"][axis])
+                for axis in range(3)
+            )
+        u = self.solvesys.get_param_value(handle["param"][0])
+        v = self.solvesys.get_param_value(handle["param"][1])
+        return (u, v, 0.0)
+
+    def _write_results(self):
+        """Write solved positions back to curve data."""
+        sketch = self.sketch
+        if not sketch.target_object or not sketch.target_object.data:
+            return
+
+        curve_data = sketch.target_object.data
+        n_curves = len(curve_data.curves)
+        type_attr = curve_data.attributes.get("sketch_type")
+        if not has_uuid_field(curve_data, "curve_id") or not type_attr:
+            return
+
+        # Bulk-read ids once instead of per-curve get_uuid (see _init_geometry).
+        from .utilities.curve_data import read_uuid_list
+
+        cid_list = read_uuid_list(curve_data, "curve_id")
+        cp_list = read_uuid_list(curve_data, "center_point_id")
+
+        # Point curves whose solved position actually differs from what is stored.
+        # The third pass rebuilds only the segments referencing these, instead of
+        # re-deriving every arc/circle bezier in the sketch on every solve -- a
+        # drag moves a handful of points out of hundreds (issue #342).
+        #
+        # A segment's geometry is a pure function of its referenced point
+        # positions, so a point the solver rewrites with an unchanged value cannot
+        # change any segment and is deliberately left out. That relies on the
+        # invariant every writer of point positions already maintains: whoever
+        # moves a point rebuilds its segments (see batch_update).
+        moved_point_ids = set()
+
+        types, first_idx, stored_positions = _bulk_curve_arrays(curve_data, type_attr)
+
+        # First pass: update all point positions
+        solved_indices, solved_positions, solved_cids = [], [], []
+        for curve_idx in range(n_curves):
+            ctype = types[curve_idx]
+            cid = cid_list[curve_idx]
+
+            if ctype == SketchCurveType.POINT:
+                pos = self._get_solved_point_position(cid)
+                if pos:
+                    solved_indices.append(first_idx[curve_idx])
+                    solved_positions.append(pos)
+                    solved_cids.append(cid)
+
+        if solved_indices:
+            # Compare as float32, the attribute's own storage: the solver works in
+            # double, so a solved value that merely round-trips would never equal
+            # the stored one under an exact double compare, and every point would
+            # look moved. Comparing what would actually be *stored* makes "moved"
+            # mean "the bytes change", with no tolerance to tune.
+            current = stored_positions[solved_indices]
+            incoming = np.asarray(solved_positions, dtype=np.float32)
+            for k in np.flatnonzero((incoming != current).any(axis=1)).tolist():
+                curve_data.points[solved_indices[k]].position = solved_positions[k]
+                moved_point_ids.add(solved_cids[k])
+
+        # Second pass: update circle/arc edge positions from solved radius
+        for curve_idx in range(n_curves):
+            ctype = types[curve_idx]
+            cid = cid_list[curve_idx]
+
+            if ctype == SketchCurveType.CIRCLE and cid in self._distance_params:
+                dist_param = self._distance_params[cid]
+                param_h = dist_param.get("param", [0])[0]
+                solved_radius = (
+                    self.solvesys.get_param_value(param_h) if param_h else None
+                )
+                cp_id = cp_list[curve_idx]
+                if cp_id and solved_radius is not None:
+                    ct_pos = self._get_solved_point_position(cp_id)
+                    if ct_pos:
+                        # Update first edge point at new radius
+                        curve_slice = curve_data.curves[curve_idx]
+                        first = curve_slice.points[0].index
+                        edge = (
+                            ct_pos[0] + solved_radius,
+                            ct_pos[1],
+                            ct_pos[2],
+                        )
+                        point = curve_data.points[first]
+                        if _stored_differs(point.position, edge):
+                            point.position = edge
+                            # This circle's radius changed but its centre may not
+                            # have moved, so nothing above would have flagged it.
+                            # rebuild_segments matches a circle through the centre
+                            # point it references, so that is the id to add.
+                            moved_point_ids.add(cp_id)
+
+        # Third pass: rebuild segments from updated point positions.
+        if getattr(sketch, "is_3d", False):
+            from .model.native_3d import rebuild_3d_lines
+
+            rebuild_3d_lines(sketch)
+        else:
+            from .utilities.curve_data import compute_merge_ids, rebuild_segments
+
+            rebuild_segments(sketch, point_ids=moved_point_ids)
+            # A scoped rebuild skips merge ids (they track connectivity, which a
+            # move cannot change). A solve reaches here after topology edits too,
+            # so keep recomputing them exactly as the unscoped call used to.
+            compute_merge_ids(sketch)
+
+        # Sync entity.co from solved curve positions (bridge for gizmo positioning)
+        # TODO: Remove when gizmos read from curve data directly
+        entities = self.context.scene.sketcher.entities
+        seg_attr = curve_data.attributes.get("segment_entity_index")
+        if seg_attr:
+            entity_indices = np.zeros(n_curves, dtype=np.int32)
+            seg_attr.data.foreach_get("value", entity_indices)
+            for curve_idx in np.flatnonzero(entity_indices).tolist():
+                entity = entities.get(int(entity_indices[curve_idx]))
+                if entity is None:
+                    continue
+                ctype = types[curve_idx]
+                if ctype == SketchCurveType.POINT and hasattr(entity, "co"):
+                    pt_idx = curve_data.curves[curve_idx].points[0].index
+                    pos = curve_data.points[pt_idx].position
+                    entity.co = (pos[0], pos[1])
+                elif ctype == SketchCurveType.CIRCLE:
+                    dist = self._distance_params.get(cid_list[curve_idx])
+                    if dist and hasattr(entity, "radius"):
+                        entity.radius = self.solvesys.get_param_value(dist["param"][0])
+
+    def solve(self, write=True):
+        """Run the solver on curve data.
+
+        A drag can over-constrain an already-determined sketch: a fully defined
+        (0-DOF) sketch is pinned, so pulling a point to the cursor contradicts
+        the existing constraints and solvespace reports it 'Inconsistent'.
+        Dragging a fully constrained sketch should be a no-op, so on that failure
+        we drop the drag and re-solve, keeping the sketch's valid, constrained
+        state instead of flipping it to inconsistent (issue #584).
+        """
+        self._solve_once(write=write)
+        if not self.ok and self._tweak_curve_id is not None:
+            self._tweak_curve_id = None
+            self._tweak_pos = None
+            self._solve_once(write=write)
+        return self.ok
+
+    def drag_to(self, pos) -> bool:
+        """Solve with the dragged curve pulled to ``pos``, reusing the loaded system.
+
+        A drag re-solves on every mouse move. Rebuilding from curve data each
+        time restarts solvespace from float32-rounded positions and re-seeded
+        tangent helper points, which makes linkages lurch. While the system
+        this solver built is still loaded, only the drag point moves and the
+        same system is re-solved. Anything else (first call, another solve
+        cleared slvs, a failed solve) falls back to a full rebuild.
+        """
+        self._tweak_pos = pos
+        if self._drag_handle is not None and self._generation == _sketch_generation:
+            tw_u, tw_v = self._tweak_uv()
+            params = self._drag_handle["param"]
+            self.solvesys.set_param_value(params[0], tw_u)
+            self.solvesys.set_param_value(params[1], tw_v)
+            result = self.solvesys.solve_sketch(self.group_sketch, True)
+            if self._apply_result(result, write=True):
+                return True
+        self._tweak_curve_id = self._drag_curve_id
+        self._tweak_pos = pos
+        return self.solve()
+
+    def _solve_once(self, write=True):
+        """Build and solve the system once from the current curve/tweak state."""
+        self._generation = _clear_sketch(self.solvesys)
+        self._drag_handle = None
+        self._point_handles.clear()
+        self._entity_handles.clear()
+        self._distance_params.clear()
+        self._curve_types = {}
+        self._constraint_by_handle = {}
+
+        self._init_workplane()
+        self._init_geometry()
+        # Publish the sketch so the constraints being built (and the dimension
+        # values they read) resolve it for free instead of each re-deriving it.
+        target = getattr(self.sketch, "target_object", None)
+        with (
+            sketch_resolution(self._resolution_sketch()),
+            published_curve_types(target.data if target else None, self._curve_types),
+        ):
+            self._init_constraints()
+
+        result = self.solvesys.solve_sketch(self.group_sketch, True)
+        return self._apply_result(result, write=write)
+
+    def _apply_result(self, result, write=True) -> bool:
+        """Publish a solve_sketch result and, if it solved, write positions back."""
+        # solve_sketch returns either the result dict or (result, failed_handles),
+        # where failed_handles lists the constraints solvespace couldn't satisfy.
+        failed_handles = []
+        if isinstance(result, dict):
+            retval = result
+        else:
+            retval, *rest = result
+            if rest and isinstance(rest[0], (list, tuple)):
+                failed_handles = rest[0]
+
+        from .global_data import solver_state_items
+        from .utilities.bpy import bpyEnum
+
+        result_code = retval["result"]
+        self.ok = result_code == 0 or result_code == 4
+
+        # Flag the offending constraints so the UI (constraint list + gizmos) can
+        # point the user at what to remove -- an inconsistent sketch can't solve,
+        # so nothing in it moves (not even unconstrained geometry) until the
+        # contradictions are cleared.
+        for h in failed_handles:
+            c = self._constraint_by_handle.get(h)
+            if c is not None:
+                c.failed = True
+
+        if result_code > 4:
+            self.result = bpyEnum(solver_state_items, index=5)
+        else:
+            self.result = bpyEnum(solver_state_items, index=result_code)
+
+        self.sketch.solver_state = self.result.identifier
+        # A tweak solve augments the system with a temporary dragged/coincident
+        # pin (see _init_geometry), so its reported dof is ~2 lower than the
+        # sketch's real dof. Dragging doesn't change the true dof, so don't
+        # publish the tweak value (it would read as "fully defined" after a
+        # drag); the tweak operator does a clean re-solve on release.
+        if self._tweak_curve_id is None:
+            self.sketch.dof = retval.get("dof", 0)
+
+        # write=False validates solvability (dof, solver_state are already set
+        # above) without committing solved positions, so an interactive trial
+        # never drags existing geometry; the scene is updated only by a
+        # committing solve (in fini).
+        if self.ok and write:
+            self._write_results()
+            self.sketch.geometry_solved = True
+
+        return self.ok
+
+
+Solver = CurveSolver
+
+
+def solve_sketch_from_curves(context, sketch, write=True):
+    """Convenience function to solve a sketch using curve data.
+
+    With ``write=False`` the system is solved to report its state without
+    committing solved positions back to the geometry.
+    """
+    if not sketch:
+        return False
+    solver = CurveSolver(context, sketch)
+    return solver.solve(write=write)
+
+
+def solve_system(context, sketch=None, write=True):
+    """Solve the constraint system for a sketch.
+
+    ``write=False`` validates solvability without writing solved positions back,
+    so an interactive trial (see ``add_auto_constraint``) never drags existing
+    geometry; the scene is updated only by the committing solve in fini.
+    """
+    if sketch and sketch.target_object and sketch.target_object.data:
+        if len(sketch.target_object.data.curves) > 0:
+            return solve_sketch_from_curves(context, sketch, write=write)
+    return True

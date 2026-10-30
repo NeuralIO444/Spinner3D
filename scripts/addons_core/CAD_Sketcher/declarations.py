@@ -1,0 +1,191 @@
+# Please keep this file in alphabetical order
+from enum import Enum
+
+# Blender's built-in Select Box tool — the standard tool we return to when
+# leaving one of our tools (ESC / cancel).
+BLENDER_SELECT_TOOL = "builtin.select_box"
+
+
+class Gizmos(str, Enum):
+    Angle = "VIEW3D_GT_slvs_angle"
+    Constraint = "VIEW3D_GT_slvs_constraint"
+    ConstraintValue = "VIEW3D_GT_slvs_constraint_value"
+    Diameter = "VIEW3D_GT_slvs_diameter"
+    Distance = "VIEW3D_GT_slvs_distance"
+    ObjectHover = "VIEW3D_GT_slvs_object_hover"
+    Preselection = "VIEW3D_GT_slvs_preselection"
+    Workplane = "VIEW3D_GT_slvs_workplane"
+
+
+class GizmoGroups(str, Enum):
+    Angle = "VIEW3D_GGT_slvs_angle"
+    Constraint = "VIEW3D_GGT_slvs_constraint"
+    Diameter = "VIEW3D_GGT_slvs_diameter"
+    Distance = "VIEW3D_GGT_slvs_distance"
+    ObjectHover = "VIEW3D_GGT_slvs_object_hover"
+    Preselection = "VIEW3D_GGT_slvs_preselection"
+    Workplane = "VIEW3D_GGT_slvs_workplane"
+
+
+class Operators(str, Enum):
+    AddAngle = "view3d.slvs_add_angle"
+    SetCurveFlag = "view3d.slvs_set_curve_flag"
+    AddArc2D = "view3d.slvs_add_arc2d"
+    AddArc3Point2D = "view3d.slvs_add_arc3pt2d"
+    AddCircle2D = "view3d.slvs_add_circle2d"
+    AddCoincident = "view3d.slvs_add_coincident"
+    AddDiameter = "view3d.slvs_add_diameter"
+    AddDimension = "view3d.slvs_add_dimension"
+    AddDistance = "view3d.slvs_add_distance"
+    AddEqual = "view3d.slvs_add_equal"
+    AddHorizontal = "view3d.slvs_add_horizontal"
+    AddLine2D = "view3d.slvs_add_line2d"
+    AddLine3D = "view3d.slvs_add_line3d"
+    AddMidPoint = "view3d.slvs_add_midpoint"
+    AddParallel = "view3d.slvs_add_parallel"
+    AddPerpendicular = "view3d.slvs_add_perpendicular"
+    AddPoint2D = "view3d.slvs_add_point2d"
+    AddPoint3D = "view3d.slvs_add_point3d"
+    AddPresetTheme = "bgs.theme_preset_add"
+    AddRatio = "view3d.slvs_add_ratio"
+    AddSymmetry = "view3d.slvs_add_symmetry"
+    AddRectangle = "view3d.slvs_add_rectangle"
+    AddRectangleCenter = "view3d.slvs_add_rectangle_center"
+    AddRectangle3Point = "view3d.slvs_add_rectangle_3point"
+    AddSketch = "view3d.slvs_add_sketch"
+    AddSketch3D = "view3d.slvs_add_sketch3d"
+    AddAssembly = "view3d.slvs_add_assembly"
+    InstancePart = "view3d.slvs_instance_part"
+    MakePart = "view3d.slvs_make_part"
+    DuplicatePart = "view3d.slvs_duplicate_part"
+    AddSketchOnPlane = "view3d.slvs_add_sketch_on_plane"
+    AddTangent = "view3d.slvs_add_tangent"
+    AddVertical = "view3d.slvs_add_vertical"
+    ChangeSketchWorkplane = "view3d.slvs_change_sketch_workplane"
+    MakeWorkplaneFree = "view3d.slvs_make_workplane_free"
+    MigrateLegacy = "view3d.slvs_migrate_legacy"
+    RepairBodies = "view3d.slvs_repair_bodies"
+    ReattachWorkplane = "view3d.slvs_reattach_workplane"
+    AlignWorkplaneCursor = "view3d.slvs_align_workplane_cursor"
+    AlignView = "view3d.slvs_align_view"
+    BatchSet = "view3d.slvs_batch_set"
+    ContextMenu = "view3d.slvs_context_menu"
+    Copy = "view3d.slvs_copy"
+    DeleteConstraint = "view3d.slvs_delete_constraint"
+    EditConstraintValue = "view3d.slvs_edit_constraint_value"
+    DeleteEntity = "view3d.slvs_delete_entity"
+    DeleteAssembly = "view3d.slvs_delete_assembly"
+    EditBodyMesh = "view3d.slvs_edit_body_mesh"
+    EditFeature = "view3d.slvs_edit_feature"
+    OpenPart = "view3d.slvs_open_part"
+    DissolvePart = "view3d.slvs_dissolve_part"
+    RemoveFromPart = "view3d.slvs_remove_from_part"
+    DeleteFeature = "view3d.slvs_delete_feature"
+    DeletePart = "view3d.slvs_delete_part"
+    DeleteSketch = "view3d.slvs_delete_sketch"
+    MergePoints = "view3d.slvs_merge_points"
+    Paste = "view3d.slvs_paste"
+    Move = "view3d.slvs_move"
+    Offset = "view3d.slvs_offset"
+    NodeExtrude = "view3d.slvs_node_extrude"
+    NodeArrayLinear = "view3d.slvs_node_array_linear"
+    NodeArrayCircular = "view3d.slvs_node_array_circular"
+    NodeRevolve = "view3d.slvs_node_revolve"
+    NodeBoolean = "view3d.slvs_node_boolean"
+    ProjectGeometry = "view3d.slvs_project_geometry"
+    RenameCurve = "view3d.slvs_rename_curve"
+    FlipArc = "view3d.slvs_flip_arc"
+    Restore = "view3d.slvs_restore"
+    HoverCycle = "view3d.slvs_hover_cycle"
+    Select = "view3d.slvs_select"
+    SelectAll = "view3d.slvs_select_all"
+    SelectBox = "view3d.slvs_select_box"
+    SelectInvert = "view3d.slvs_select_invert"
+    SelectExtendAll = "view3d.slvs_select_extend_all"
+    SelectExtend = "view3d.slvs_select_extend"
+    SetActiveSketch = "view3d.slvs_set_active_sketch"
+    SetBodyVisibility = "view3d.slvs_set_body_visibility"
+    SetCutterVisibility = "view3d.slvs_set_cutter_visibility"
+    SetPartVisibility = "view3d.slvs_set_part_visibility"
+    SetSketchVisibility = "view3d.slvs_set_sketch_visibility"
+    SetAllConstraintsVisibility = "view3d.slvs_set_all_constraints_visibility"
+    ShowSolverState = "view3d.slvs_show_solver_state"
+    Snapshot = "view3d.slvs_snapshot"
+    Solve = "view3d.slvs_solve"
+    Update = "view3d.slvs_update"
+    Trim = "view3d.slvs_trim"
+    Bevel = "view3d.slvs_bevel"
+    Tweak = "view3d.slvs_tweak"
+    TweakConstraintValuePos = "view3d.slvs_tweak_constraint_value_pos"
+
+
+class Macros(str, Enum):
+    DuplicateMove = "view3d.slvs_duplicate_move"
+
+
+class Menus(str, Enum):
+    SelectedMenu = "VIEW3D_MT_selected_menu"
+    AddSketch = "VIEW3D_MT_slvs_add_sketch"
+    SketchWorkplane = "VIEW3D_MT_slvs_sketch_workplane"
+    PartSketches = "VIEW3D_MT_slvs_part_sketches"
+    Part = "VIEW3D_MT_slvs_part"
+
+
+class Panels(str, Enum):
+    Sketcher = "VIEW3D_PT_sketcher"
+    SketcherDebugPanel = "VIEW3D_PT_sketcher_debug_panel"
+    SketcherTools = "VIEW3D_PT_sketcher_tools"
+    SketcherConstraints = "VIEW3D_PT_sketcher_constraints"
+    SketcherEntities = "VIEW3D_PT_sketcher_entities"
+
+
+class VisibilityTypes(str, Enum):
+    Hide = "HIDE"
+    Show = "SHOW"
+
+
+class WorkSpaceTools(str, Enum):
+    AddArc2D = "sketcher.slvs_add_arc2d"
+    AddArc3Point2D = "sketcher.slvs_add_arc3pt2d"
+    AddCircle2D = "sketcher.slvs_add_circle2d"
+    AddDimension = "sketcher.slvs_add_dimension"
+    AddLine2D = "sketcher.slvs_add_line2d"
+    AddLine3D = "sketcher.slvs_add_line3d"
+    AddPoint2D = "sketcher.slvs_add_point2d"
+    AddPoint3D = "sketcher.slvs_add_point3d"
+    AddRectangle = "sketcher.slvs_add_rectangle"
+    AddRectangleCenter = "sketcher.slvs_add_rectangle_center"
+    AddRectangle3Point = "sketcher.slvs_add_rectangle_3point"
+    Offset = "sketcher.slvs_offset"
+    Select = "sketcher.slvs_select"
+    Trim = "sketcher.slvs_trim"
+    Bevel = "sketcher.slvs_bevel"
+    AddSketch = "sketcher.slvs_add_sketch"
+    ProjectGeometry = "sketcher.slvs_project_geometry"
+    Extrude = "sketcher.slvs_node_extrude"
+    ArrayLinear = "sketcher.slvs_node_array_linear"
+    ArrayCircular = "sketcher.slvs_node_array_circular"
+    Revolve = "sketcher.slvs_node_revolve"
+
+
+# Dimension tool kinds listed with the constraints (see operators/add_dimension).
+DimensionKinds = ("DISTANCE", "ANGLE", "DIAMETER")
+
+GeometricConstraintOperators = (
+    Operators.AddCoincident,
+    Operators.AddEqual,
+    Operators.AddVertical,
+    Operators.AddHorizontal,
+    Operators.AddParallel,
+    Operators.AddPerpendicular,
+    Operators.AddTangent,
+    Operators.AddMidPoint,
+    Operators.AddRatio,
+    Operators.AddSymmetry,
+)
+
+# Constraints the native free-3D solver can currently apply. Everything else is
+# hidden while a 3D sketch is active (the solver only dispatches DISTANCE for 3D
+# sketches today; other types would be silently ignored).
+Supported3DDimensionKinds = ("DISTANCE",)
+Supported3DConstraintOperators = ()

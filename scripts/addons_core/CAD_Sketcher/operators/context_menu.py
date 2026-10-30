@@ -1,0 +1,101 @@
+import bpy
+from bpy.props import BoolProperty, IntProperty, StringProperty
+from bpy.types import Context, Event, Operator, PropertyGroup
+from bpy.utils import register_classes_factory
+
+from ..declarations import Operators
+from ..drawing import selection
+from ..model.sketch_ref import get_active_constraints
+from ..utilities.highlighting import HighlightElement
+
+
+class View3D_OT_slvs_context_menu(Operator, HighlightElement):
+    """Show element's settings"""
+
+    bl_idname = Operators.ContextMenu
+    bl_label = "Sketcher Context Menu"
+
+    type: StringProperty(name="Type", options={"SKIP_SAVE"})
+    index: IntProperty(name="Index", default=-1, options={"SKIP_SAVE"})
+    curve_id: StringProperty(name="Curve ID", default="", options={"SKIP_SAVE"})
+    delayed: BoolProperty(default=False)
+
+    @classmethod
+    def description(cls, context: Context, properties: PropertyGroup):
+        cls.handle_highlight_hover(context, properties)
+        if properties.type:
+            return properties.type.capitalize()
+        return cls.__doc__
+
+    def invoke(self, context: Context, event: Event):
+        if not self.delayed:
+            return self.execute(context)
+
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context: Context, event: Event):
+        if event.value == "RELEASE":
+            return self.execute(context)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context: Context):
+        is_entity = True
+        element = None
+
+        # Constraints
+        if self.properties.is_property_set("type"):
+            constraints = get_active_constraints(context)
+            element = constraints.get_from_type_index(self.type, self.index)
+            is_entity = False
+        else:
+            # Entities — keyed by curve id
+            hover = (
+                self.curve_id
+                if self.properties.is_property_set("curve_id")
+                else selection.hover
+            )
+
+            if hover:
+                # Try as curve_id — show CurveRef info
+                from ..model.sketch_ref import get_active_sketch
+
+                sketch = get_active_sketch(context)
+                if sketch:
+                    from ..model.curve_ref import curve_ref
+
+                    ref = curve_ref(sketch, hover)
+                    if ref.valid:
+                        element = ref
+                        # Load the entity's settings (name, and point position)
+                        # into the inline editor drawn by draw_props/draw_settings.
+                        from ..model.group_sketcher import seed_entity_editor
+
+                        seed_entity_editor(context, ref)
+
+        def draw_context_menu(self, context: Context):
+            col = self.layout.column()
+            element.draw_props(col)
+
+            col.separator()
+            row = col.row()
+            row.alert = True
+            if is_entity:
+                # The origin is protected — show Delete grayed out.
+                row.enabled = not getattr(element, "is_origin", False)
+                op = row.operator(Operators.DeleteEntity, text="Delete", icon="X")
+                op.index = element._curve_id
+            else:
+                op = row.operator(Operators.DeleteConstraint, text="Delete", icon="X")
+                op.type = element.type
+                op.index = element.index()
+
+        if not element:
+            bpy.ops.wm.call_menu(name="VIEW3D_MT_selected_menu")
+            return {"FINISHED"}
+
+        context.window_manager.popup_menu(draw_context_menu)
+        return {"FINISHED"}
+
+
+register, unregister = register_classes_factory((View3D_OT_slvs_context_menu,))
