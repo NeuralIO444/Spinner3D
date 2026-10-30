@@ -13,3 +13,10 @@ workspace = true
 
 [dependencies]
 spinner-stroke-core = { path = "../spinner-stroke-core" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "stroke_1euro"
+harness = false
