@@ -15,10 +15,17 @@ pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
     d_cutoff: f32,
     dt: f32,
     out: *mut f32,
+    out_len: u32,
 ) -> i32 {
     let result = catch_unwind(|| {
-        if points.is_null() || out.is_null() || len == 0 {
+        if len == 0 {
+            return 0; // empty is valid
+        }
+        if points.is_null() || out.is_null() {
             return -1;
+        }
+        if out_len < len.saturating_mul(2) {
+            return -7; // out too small
         }
         let n = match (len as usize).checked_mul(2) { Some(v) => v, None => return -3 };
         if n > (isize::MAX as usize) / size_of::<f32>() {
@@ -85,6 +92,13 @@ fn alpha(dt: f32, cutoff: f32) -> f32 {
     1.0 / (1.0 + tau / dt)
 }
 
+
+/// ABI version for the stroke FFI.
+#[no_mangle]
+pub extern "C" fn spinner_stroke_abi_version() -> u32 {
+    2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,16 +116,60 @@ mod tests {
                 1.0,
                 1.0 / 60.0,
                 output.as_mut_ptr(),
+                output.len() as u32,
             )
         };
         assert_eq!(code, 0);
     }
 
     #[test]
+
+    #[test]
+    fn golden_constant_input() {
+        // Constant input should stay constant.
+        let input = vec![1.0_f32, 2.0, 1.0, 2.0, 1.0, 2.0];
+        let mut output = vec![0.0_f32; input.len()];
+        let code = unsafe {
+            spinner_stroke_smooth_1euro(
+                input.as_ptr(),
+                3,
+                1.0,
+                0.0,
+                1.0,
+                1.0 / 60.0,
+                output.as_mut_ptr(),
+                output.len() as u32,
+            )
+        };
+        assert_eq!(code, 0);
+        for i in 0..3 {
+            assert!((output[i * 2] - 1.0).abs() < 1e-5);
+            assert!((output[i * 2 + 1] - 2.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn rejects_small_out() {
+        let input = vec![0.0_f32; 4];
+        let mut output = vec![0.0_f32; 2];
+        let code = unsafe {
+            spinner_stroke_smooth_1euro(
+                input.as_ptr(),
+                2,
+                1.0,
+                0.0,
+                1.0,
+                1.0 / 60.0,
+                output.as_mut_ptr(),
+                output.len() as u32,
+            )
+        };
+        assert_eq!(code, -7);
+    }
     fn rejects_overlap() {
         let mut buf = vec![0.0_f32; 4];
         let code = unsafe {
-            spinner_stroke_smooth_1euro(buf.as_ptr(), 2, 1.0, 0.0, 1.0, 1.0 / 60.0, buf.as_mut_ptr())
+            spinner_stroke_smooth_1euro(buf.as_ptr(), 2, 1.0, 0.0, 1.0, 1.0 / 60.0, buf.as_mut_ptr(), buf.len() as u32)
         };
         assert_eq!(code, -5);
     }
