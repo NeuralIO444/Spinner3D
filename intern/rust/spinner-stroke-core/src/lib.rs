@@ -40,3 +40,30 @@ fn alpha(dt: f32, cutoff: f32) -> f32 {
     let tau = 1.0 / (2.0 * std::f32::consts::PI * cutoff.max(1e-6));
     1.0 / (1.0 + tau / dt)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn golden_constant() {
+        let input = vec![1.0_f32, 2.0, 1.0, 2.0, 1.0, 2.0];
+        let mut output = vec![0.0_f32; input.len()];
+        smooth_1euro(&input, 1.0, 0.0, 1.0, 1.0 / 60.0, &mut output);
+        for i in 0..3 {
+            assert!((output[i * 2] - 1.0).abs() < 1e-5, "x[{}]={}", i, output[i * 2]);
+            assert!((output[i * 2 + 1] - 2.0).abs() < 1e-5, "y[{}]={}", i, output[i * 2 + 1]);
+        }
+    }
+
+    #[test]
+    fn golden_step_response() {
+        // Step from 0 to 1 should approach 1 monotonically.
+        let input = vec![0.0_f32, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let mut output = vec![0.0_f32; input.len()];
+        smooth_1euro(&input, 1.0, 0.0, 1.0, 1.0 / 60.0, &mut output);
+        assert!(output[2] > 0.0 && output[2] < 1.0);
+        assert!(output[4] >= output[2]);
+        assert!(output[6] >= output[4]);
+    }
+}

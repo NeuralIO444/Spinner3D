@@ -67,5 +67,18 @@ jobs:
             -lspinner_stroke -lspinner_gesture -lspinner_pressure \
             -lpthread -ldl -lm
           ./smoke/smoke
+      - name: C smoke test (Windows)
+        if: runner.os == 'Windows'
+        working-directory: intern/rust
+        shell: bash
+        run: |
+          cargo build --release -p spinner-stroke -p spinner-gesture -p spinner-pressure
+          # MSVC-style link; .lib files are produced alongside the .a on Windows
+          cl.exe /nologo /Fe:smoke/smoke.exe smoke/smoke.c \
+            /link /LIBPATH:target/release \
+            spinner_stroke.lib spinner_gesture.lib spinner_pressure.lib \
+            ws2_32.lib userenv.lib bcrypt.lib advapi32.lib
+          ./smoke/smoke.exe
+
 
 
