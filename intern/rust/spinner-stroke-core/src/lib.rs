@@ -20,7 +20,7 @@ pub fn smooth_1euro(
     let mut prev_dy = 0.0_f32;
     output[0] = prev_x;
     output[1] = prev_y;
-    let a_base = alpha(dt, cutoff);
+    let _a_base = alpha(dt, cutoff);
     let a_d = alpha(dt, d_cutoff);
     for i in 1..(input.len() / 2) {
         let x = input[i * 2];

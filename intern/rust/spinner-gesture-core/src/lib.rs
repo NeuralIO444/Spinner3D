@@ -9,6 +9,7 @@ pub enum GestureKind {
 }
 
 /// Classify a gesture. Tap is returned only when `pressed == false` (release).
+#[allow(clippy::result_unit_err)]
 pub fn classify(
     pressed: bool,
     moved_px: f32,
