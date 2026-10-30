@@ -50,6 +50,7 @@
 #include "IMB_imbuf_types.hh"
 
 #include "paint_intern.hh"
+#include "spinner_stroke_shim.hh"
 
 #include "mesh/sculpt_cloth.hh"
 #include "mesh/sculpt_intern.hh"
@@ -604,6 +605,14 @@ static bool paint_smooth_stroke(const Brush &brush,
     r_mouse = sample->mouse;
     r_pressure = sample->pressure;
   }
+
+#ifdef WITH_SPINNER_RUST_STROKE
+  /* Optional Rust 1€ post-smooth. Flag default OFF. */
+  float2 rust_mouse;
+  if (spinner::stroke_smooth_1euro(r_mouse, rust_mouse)) {
+    r_mouse = rust_mouse;
+  }
+#endif
 
   return true;
 }

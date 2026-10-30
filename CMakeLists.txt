@@ -1331,6 +1331,7 @@ When requirements for a build option are not met, error instead of disabling the
 
 # Spinner3D Rust modules (strangler pattern). Default OFF so upstream merges stay clean.
 option(WITH_SPINNER_RUST "Build Spinner3D Rust modules via Corrosion" OFF)
+option(WITH_SPINNER_RUST_STROKE "Use Rust 1€ smoother in paint strokes" OFF)
 mark_as_advanced(WITH_SPINNER_RUST)
 
 if(NOT WITH_BLENDER AND NOT WITH_CYCLES_STANDALONE AND NOT WITH_CYCLES_HYDRA_RENDER_DELEGATE)
