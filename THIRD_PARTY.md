@@ -17,7 +17,7 @@ All crates must be compatible with GPL-3.0-or-later. Enforced by `cargo-deny` in
 | Bool Tool | v2.1 (2026-07-14) | GPL-3.0-or-later | https://github.com/nickberckley/bool_tool | Bundle under `scripts/addons_core/` or extensions path. Cutters go into a hidden `Cutters` collection. |
 | CAD Sketcher | 0.32.2 (bundled) | GPL-3.0-or-later | https://github.com/hlorus/CAD_Sketcher | Bundled under scripts/addons_core/CAD_Sketcher/ with pinned py-slvs (slvs) wheels for win/mac/linux, Python 3.11+3.13. No runtime pip. |
 | py-slvs / SolveSpace bindings | (bundled with CAD Sketcher) | GPL-3 | https://github.com/realthunder/slvs_py | Pinned wheels; do not fetch at runtime. |
-| QRemeshify | 1.1.0 (2026-10-08) | GPL-3.0 | https://github.com/ksami/QRemeshify | Bundle with platform binaries. Expose as “Remesh: Hard-Surface Quads”. Uses sharp edges and face sets as boundaries. |
+| QRemeshify | 1.1.0 (macOS) | GPL-3.0 | https://github.com/ksami/QRemeshify | Bundled under scripts/addons_core/QRemeshify/ with macOS dylibs only (liblib_quadwild.dylib, liblib_quadpatches.dylib). Expose as “Remesh: Hard-Surface Quads”. |
 | QuadWild / bi-MDF | (used by QRemeshify) | GPL-3 | https://github.com/mlivesu/QuadWild | Upstream library. |
 | Instant Meshes | (optional) | BSD | https://github.com/wjakob/instant-meshes | Optional subprocess remesh. Binary path set in Preferences. |
 | Manifold | (already in Blender) | (upstream) | https://github.com/elalish/manifold | Make default boolean solver with Exact fallback. |
