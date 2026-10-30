@@ -1,0 +1,84 @@
+name: Spinner Rust
+
+on:
+  push:
+    branches: [spinner/rust-*]
+    paths:
+      - 'intern/rust/**'
+      - 'build_files/cmake/spinner_rust.cmake'
+      - '.github/workflows/spinner-rust.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'intern/rust/**'
+      - 'build_files/cmake/spinner_rust.cmake'
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt
+        working-directory: intern/rust
+        run: cargo fmt --check
+      - name: cargo clippy
+        working-directory: intern/rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        working-directory: intern/rust
+        run: cargo test --workspace
+      - name: check no panic = abort
+        working-directory: intern/rust
+        run: |
+          if grep -r 'panic.*=.*"abort"' --include='Cargo.toml' .; then
+            echo "panic = abort found; catch_unwind will not work"
+            exit 1
+          fi
+          echo "no panic = abort"
+      - name: install cbindgen
+        run: cargo install cbindgen --locked
+      - name: generate headers
+        working-directory: intern/rust
+        shell: bash
+        run: ./gen_headers.sh
+      - name: check headers exist
+        working-directory: intern/rust
+        run: |
+          test -f include/spinner-stroke.h
+          test -f include/spinner-gesture.h
+          test -f include/spinner-pressure.h
+          echo "headers generated"
+      - name: C smoke test
+        if: runner.os != 'Windows'
+        working-directory: intern/rust
+        shell: bash
+        run: |
+          cargo build --release -p spinner-stroke -p spinner-gesture -p spinner-pressure
+          cc -o smoke/smoke smoke/smoke.c \
+            -L target/release \
+            -lspinner_stroke -lspinner_gesture -lspinner_pressure \
+            -lpthread -ldl -lm
+          ./smoke/smoke
+      - name: C smoke test (Windows)
+        if: runner.os == 'Windows'
+        working-directory: intern/rust
+        shell: bash
+        run: |
+          cargo build --release -p spinner-stroke -p spinner-gesture -p spinner-pressure
+          # MSVC-style link; .lib files are produced alongside the .a on Windows
+          cl.exe /nologo /Fe:smoke/smoke.exe smoke/smoke.c \
+            /link /LIBPATH:target/release \
+            spinner_stroke.lib spinner_gesture.lib spinner_pressure.lib \
+            ws2_32.lib userenv.lib bcrypt.lib advapi32.lib
+          ./smoke/smoke.exe
+
+
+
