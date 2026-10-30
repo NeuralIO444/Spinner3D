@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn classifies_tap() {
-        let k = spinner_gesture_classify(1, 2.0, 80.0, 8.0, 200.0);
+        let k = spinner_gesture_classify(0, 2.0, 80.0, 8.0, 200.0);
         assert_eq!(k, GestureKind::Tap as i32);
     }
 
