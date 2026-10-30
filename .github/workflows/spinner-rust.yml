@@ -56,4 +56,16 @@ jobs:
           test -f include/spinner-gesture.h
           test -f include/spinner-pressure.h
           echo "headers generated"
+      - name: C smoke test
+        if: runner.os != 'Windows'
+        working-directory: intern/rust
+        shell: bash
+        run: |
+          cargo build --release -p spinner-stroke -p spinner-gesture -p spinner-pressure
+          cc -o smoke/smoke smoke/smoke.c \
+            -L target/release \
+            -lspinner_stroke -lspinner_gesture -lspinner_pressure \
+            -lpthread -ldl -lm
+          ./smoke/smoke
+
 
