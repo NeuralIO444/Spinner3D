@@ -10,3 +10,6 @@ crate-type = ["staticlib", "cdylib"]
 
 [lints]
 workspace = true
+
+[dependencies]
+spinner-stroke-core = { path = "../spinner-stroke-core" }

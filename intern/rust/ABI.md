@@ -19,3 +19,10 @@ int spinner_stroke_smooth_1euro(
 
 ## License
 See `deny.toml` for the SPDX allowlist.
+
+## Core crates
+- `spinner-stroke-core`, `spinner-gesture-core`, `spinner-pressure-core` have `#![forbid(unsafe_code)]`.
+- FFI crates depend on the cores and contain only the pointer checks and exports.
+
+## Headers
+Run `./gen_headers.sh` (requires cbindgen) to regenerate `include/*.h`.
