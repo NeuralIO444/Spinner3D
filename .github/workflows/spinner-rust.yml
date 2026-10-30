@@ -1,0 +1,37 @@
+name: Spinner Rust
+
+on:
+  push:
+    branches: [spinner/rust-*]
+    paths:
+      - 'intern/rust/**'
+      - 'build_files/cmake/spinner_rust.cmake'
+      - '.github/workflows/spinner-rust.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'intern/rust/**'
+      - 'build_files/cmake/spinner_rust.cmake'
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt
+        working-directory: intern/rust
+        run: cargo fmt --check
+      - name: cargo clippy
+        working-directory: intern/rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        working-directory: intern/rust
+        run: cargo test --workspace
