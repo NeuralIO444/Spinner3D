@@ -35,3 +35,25 @@ jobs:
       - name: cargo test
         working-directory: intern/rust
         run: cargo test --workspace
+      - name: check no panic = abort
+        working-directory: intern/rust
+        run: |
+          if grep -r 'panic.*=.*"abort"' --include='Cargo.toml' .; then
+            echo "panic = abort found; catch_unwind will not work"
+            exit 1
+          fi
+          echo "no panic = abort"
+      - name: install cbindgen
+        run: cargo install cbindgen --locked
+      - name: generate headers
+        working-directory: intern/rust
+        shell: bash
+        run: ./gen_headers.sh
+      - name: check headers exist
+        working-directory: intern/rust
+        run: |
+          test -f include/spinner-stroke.h
+          test -f include/spinner-gesture.h
+          test -f include/spinner-pressure.h
+          echo "headers generated"
+
