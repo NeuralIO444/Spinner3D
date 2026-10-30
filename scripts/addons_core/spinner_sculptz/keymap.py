@@ -26,12 +26,10 @@ def register_keymap():
     addon_keymaps.append((km, kmi))
 
     # S / U / O for size / strength / falloff (radial control)
-    kmi = km.keymap_items.new("wm.radial_control", "S", "PRESS")
-    kmi.properties.data_path_primary = "tool_settings.sculpt.brush.size"
+    kmi = km.keymap_items.new("spinner_sculptz.radial_size", "S", "PRESS")
     addon_keymaps.append((km, kmi))
 
-    kmi = km.keymap_items.new("wm.radial_control", "U", "PRESS")
-    kmi.properties.data_path_primary = "tool_settings.sculpt.brush.strength"
+    kmi = km.keymap_items.new("spinner_sculptz.radial_strength", "U", "PRESS")
     addon_keymaps.append((km, kmi))
 
     # D / Shift-D for subdiv levels
@@ -42,7 +40,14 @@ def register_keymap():
 
     # B + letter brush picks (examples)
     kmi = km.keymap_items.new("spinner_sculptz.apply_brush", "B", "PRESS", ctrl=True)
-    # Note: full B+letter sequence would need a modal; this is a starter
+    addon_keymaps.append((km, kmi))
+
+    # Empty-space navigation
+    kmi = km.keymap_items.new("spinner_sculptz.navigate", "LEFTMOUSE", "PRESS")
+    addon_keymaps.append((km, kmi))
+
+    # Spacebar palette
+    kmi = km.keymap_items.new("spinner_sculptz.palette", "SPACE", "PRESS")
     addon_keymaps.append((km, kmi))
 
 

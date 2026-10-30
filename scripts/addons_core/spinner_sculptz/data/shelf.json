@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "brushes": ["Move", "ClayBuildup", "DamStandard", "hPolish", "TrimDynamic", "Inflate", "Standard", "Pinch", "SnakeHook"],
+  "mesh_tools": ["dynamesh", "subdiv_up", "subdiv_down", "isolate", "show_all"]
+}

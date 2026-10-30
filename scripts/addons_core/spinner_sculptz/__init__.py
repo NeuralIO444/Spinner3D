@@ -19,6 +19,8 @@ from . import keymap
 from . import operators
 from . import shelf
 from . import workspace
+from . import navigate
+from . import popup
 
 
 @persistent
@@ -30,6 +32,8 @@ def on_workspace_change(_):
 def register():
     operators.register()
     shelf.register()
+    navigate.register()
+    popup.register()
     keymap.register()
     workspace.register()
     bpy.app.handlers.depsgraph_update_post.append(on_workspace_change)
@@ -39,5 +43,7 @@ def unregister():
     bpy.app.handlers.depsgraph_update_post.remove(on_workspace_change)
     workspace.unregister()
     keymap.unregister()
+    popup.unregister()
+    navigate.unregister()
     shelf.unregister()
     operators.unregister()
