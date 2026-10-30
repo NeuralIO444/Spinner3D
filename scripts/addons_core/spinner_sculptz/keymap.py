@@ -1,13 +1,28 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Spinner3D Sculpt Z keymap
-# Applied only while the Sculpt Z workspace is active.
+# Items are added only while the Sculpt Z workspace is active
+# and removed on exit so they do not leak to other workspaces.
 
 import bpy
+from bpy.app.handlers import persistent
 
 addon_keymaps = []
+_active = False
+
+WORKSPACE_NAME = "Sculpt Z"
 
 
-def register_keymap():
+def _is_sculptz():
+    wm = bpy.context.window_manager
+    if not wm.windows:
+        return False
+    return wm.windows[0].workspace.name == WORKSPACE_NAME
+
+
+def _add_keymap():
+    global _active
+    if _active:
+        return
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon
     if kc is None:
@@ -15,51 +30,53 @@ def register_keymap():
 
     km = kc.keymaps.new(name="Sculpt", space_type="EMPTY")
 
-    # Ctrl mask, Ctrl-Alt unmask
-    kmi = km.keymap_items.new("sculpt.brush_stroke", "LEFTMOUSE", "PRESS", ctrl=True)
-    kmi.properties.mode = "NORMAL"
-    addon_keymaps.append((km, kmi))
+    items = [
+        ("spinner_sculptz.navigate", "LEFTMOUSE", "PRESS", {}),
+        ("spinner_sculptz.radial_size", "S", "PRESS", {}),
+        ("spinner_sculptz.radial_strength", "U", "PRESS", {}),
+        ("spinner_sculptz.subdiv_up", "D", "PRESS", {}),
+        ("spinner_sculptz.subdiv_down", "D", "PRESS", {"shift": True}),
+        ("spinner_sculptz.palette", "SPACE", "PRESS", {}),
+        ("sculpt.brush_stroke", "LEFTMOUSE", "PRESS", {"ctrl": True}),
+        ("sculpt.brush_stroke", "LEFTMOUSE", "PRESS", {"shift": True}),
+    ]
 
-    # Alt invert (handled by brush; placeholder for future)
-    # Shift smooth
-    kmi = km.keymap_items.new("sculpt.brush_stroke", "LEFTMOUSE", "PRESS", shift=True)
-    addon_keymaps.append((km, kmi))
+    for idname, key, value, kwargs in items:
+        kmi = km.keymap_items.new(idname, key, value, **kwargs)
+        addon_keymaps.append((km, kmi))
 
-    # S / U / O for size / strength / falloff (radial control)
-    kmi = km.keymap_items.new("spinner_sculptz.radial_size", "S", "PRESS")
-    addon_keymaps.append((km, kmi))
-
-    kmi = km.keymap_items.new("spinner_sculptz.radial_strength", "U", "PRESS")
-    addon_keymaps.append((km, kmi))
-
-    # D / Shift-D for subdiv levels
-    kmi = km.keymap_items.new("spinner_sculptz.subdiv_up", "D", "PRESS")
-    addon_keymaps.append((km, kmi))
-    kmi = km.keymap_items.new("spinner_sculptz.subdiv_down", "D", "PRESS", shift=True)
-    addon_keymaps.append((km, kmi))
-
-    # B + letter brush picks (examples)
-    kmi = km.keymap_items.new("spinner_sculptz.apply_brush", "B", "PRESS", ctrl=True)
-    addon_keymaps.append((km, kmi))
-
-    # Empty-space navigation
-    kmi = km.keymap_items.new("spinner_sculptz.navigate", "LEFTMOUSE", "PRESS")
-    addon_keymaps.append((km, kmi))
-
-    # Spacebar palette
-    kmi = km.keymap_items.new("spinner_sculptz.palette", "SPACE", "PRESS")
-    addon_keymaps.append((km, kmi))
+    _active = True
 
 
-def unregister_keymap():
+def _remove_keymap():
+    global _active
+    if not _active:
+        return
     for km, kmi in addon_keymaps:
-        km.keymap_items.remove(kmi)
+        try:
+            km.keymap_items.remove(kmi)
+        except Exception:
+            pass
     addon_keymaps.clear()
+    _active = False
+
+
+@persistent
+def on_depsgraph(_):
+    """Toggle keymap based on active workspace."""
+    if _is_sculptz():
+        _add_keymap()
+    else:
+        _remove_keymap()
 
 
 def register():
-    register_keymap()
+    bpy.app.handlers.depsgraph_update_post.append(on_depsgraph)
+    # Initial check
+    if _is_sculptz():
+        _add_keymap()
 
 
 def unregister():
-    unregister_keymap()
+    bpy.app.handlers.depsgraph_update_post.remove(on_depsgraph)
+    _remove_keymap()

@@ -3,6 +3,7 @@
 
 import bpy
 from bpy.types import Operator
+from . import keymap
 from bpy.app.handlers import persistent
 
 WORKSPACE_NAME = "Sculpt Z"
@@ -73,6 +74,7 @@ class SPINNER_SCULPTZ_OT_enter(Operator):
         if obj and obj.type == "MESH":
             bpy.ops.object.mode_set(mode="SCULPT")
         configure_sculptz_viewport()
+        keymap._add_keymap()
         self.report({"INFO"}, "Sculpt Z active")
         return {"FINISHED"}
 
@@ -89,6 +91,7 @@ class SPINNER_SCULPTZ_OT_exit(Operator):
             if name in bpy.data.workspaces:
                 context.window.workspace = bpy.data.workspaces[name]
                 break
+        keymap._remove_keymap()
         self.report({"INFO"}, "Left Sculpt Z")
         return {"FINISHED"}
 
