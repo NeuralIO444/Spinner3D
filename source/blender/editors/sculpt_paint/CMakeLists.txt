@@ -28,6 +28,7 @@ set(SRC
   paint_sample_color.cc
   paint_stroke.cc
   spinner_stroke_shim.cc
+  spinner_mesh_shim.cc
   paint_utils.cc
   palette.cc
   sculpt_uv.cc

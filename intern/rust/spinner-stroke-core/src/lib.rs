@@ -3,7 +3,14 @@
 
 /// Smooth interleaved [x, y, x, y, ...] points.
 /// `dt` is the time step in seconds. `d_cutoff` is the derivative cutoff.
-pub fn smooth_1euro(input: &[f32], cutoff: f32, beta: f32, d_cutoff: f32, dt: f32, output: &mut [f32]) {
+pub fn smooth_1euro(
+    input: &[f32],
+    cutoff: f32,
+    beta: f32,
+    d_cutoff: f32,
+    dt: f32,
+    output: &mut [f32],
+) {
     if input.is_empty() || output.len() < input.len() {
         return;
     }
@@ -51,8 +58,18 @@ mod tests {
         let mut output = vec![0.0_f32; input.len()];
         smooth_1euro(&input, 1.0, 0.0, 1.0, 1.0 / 60.0, &mut output);
         for i in 0..3 {
-            assert!((output[i * 2] - 1.0).abs() < 1e-5, "x[{}]={}", i, output[i * 2]);
-            assert!((output[i * 2 + 1] - 2.0).abs() < 1e-5, "y[{}]={}", i, output[i * 2 + 1]);
+            assert!(
+                (output[i * 2] - 1.0).abs() < 1e-5,
+                "x[{}]={}",
+                i,
+                output[i * 2]
+            );
+            assert!(
+                (output[i * 2 + 1] - 2.0).abs() < 1e-5,
+                "y[{}]={}",
+                i,
+                output[i * 2 + 1]
+            );
         }
     }
 

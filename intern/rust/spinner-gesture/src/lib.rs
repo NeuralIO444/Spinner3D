@@ -18,7 +18,13 @@ pub extern "C" fn spinner_gesture_classify(
     tap_timeout_ms: f32,
 ) -> i32 {
     catch_unwind(|| {
-        match spinner_gesture_core::classify(pressed != 0, moved_px, time_ms, drag_threshold_px, tap_timeout_ms) {
+        match spinner_gesture_core::classify(
+            pressed != 0,
+            moved_px,
+            time_ms,
+            drag_threshold_px,
+            tap_timeout_ms,
+        ) {
             Ok(k) => k as i32,
             Err(()) => -1,
         }

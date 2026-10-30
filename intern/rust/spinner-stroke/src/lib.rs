@@ -3,8 +3,8 @@
 //! Called from paint_stroke.cc under WITH_SPINNER_RUST_STROKE.
 //! Unsafe is confined to the FFI boundary. Every export catches panics.
 
-use std::panic::catch_unwind;
 use std::mem::{align_of, size_of};
+use std::panic::catch_unwind;
 
 #[no_mangle]
 pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
@@ -27,7 +27,10 @@ pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
         if out_len < len.saturating_mul(2) {
             return -7; // out too small
         }
-        let n = match (len as usize).checked_mul(2) { Some(v) => v, None => return -3 };
+        let n = match (len as usize).checked_mul(2) {
+            Some(v) => v,
+            None => return -3,
+        };
         if n > (isize::MAX as usize) / size_of::<f32>() {
             return -3;
         }
@@ -40,7 +43,15 @@ pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
         if (points as usize) < out_end && (out as usize) < points_end {
             return -5;
         }
-        if !cutoff.is_finite() || cutoff <= 0.0 || !beta.is_finite() || beta < 0.0 || !d_cutoff.is_finite() || d_cutoff <= 0.0 || !dt.is_finite() || dt <= 0.0 {
+        if !cutoff.is_finite()
+            || cutoff <= 0.0
+            || !beta.is_finite()
+            || beta < 0.0
+            || !d_cutoff.is_finite()
+            || d_cutoff <= 0.0
+            || !dt.is_finite()
+            || dt <= 0.0
+        {
             return -6;
         }
         let input = unsafe { std::slice::from_raw_parts(points, n) };
@@ -78,7 +89,6 @@ mod tests {
     }
 
     #[test]
-
     #[test]
     fn golden_constant_input() {
         // Constant input should stay constant.
@@ -124,7 +134,16 @@ mod tests {
     fn rejects_overlap() {
         let mut buf = vec![0.0_f32; 4];
         let code = unsafe {
-            spinner_stroke_smooth_1euro(buf.as_ptr(), 2, 1.0, 0.0, 1.0, 1.0 / 60.0, buf.as_mut_ptr(), buf.len() as u32)
+            spinner_stroke_smooth_1euro(
+                buf.as_ptr(),
+                2,
+                1.0,
+                0.0,
+                1.0,
+                1.0 / 60.0,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
         };
         assert_eq!(code, -5);
     }

@@ -9,7 +9,13 @@ pub enum GestureKind {
 }
 
 /// Classify a gesture. Tap is returned only when `pressed == false` (release).
-pub fn classify(pressed: bool, moved_px: f32, time_ms: f32, drag_threshold_px: f32, tap_timeout_ms: f32) -> Result<GestureKind, ()> {
+pub fn classify(
+    pressed: bool,
+    moved_px: f32,
+    time_ms: f32,
+    drag_threshold_px: f32,
+    tap_timeout_ms: f32,
+) -> Result<GestureKind, ()> {
     if !moved_px.is_finite() || !time_ms.is_finite() {
         return Err(());
     }
