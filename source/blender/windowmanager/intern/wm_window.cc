@@ -597,7 +597,7 @@ static void wm_window_title_text(wmWindowManager *wm,
       }
     }
     else {
-      win_title.append(StringRef("Blender"));
+      win_title.append(StringRef("Spinner3D"));  // SPINNER3D
     }
     return;
   }

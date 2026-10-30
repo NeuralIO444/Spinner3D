@@ -1132,13 +1132,13 @@ class WM_OT_url_open_preset(Operator):
           tip_("Report a bug with pre-filled version information")),
          _url_from_bug),
         (('RELEASE_NOTES', iface_("Release Notes"),
-          tip_("Read about what's new in this version of Blender")),
+          tip_("Read about what's new in this version of Spinner3D")),  # SPINNER3D
          _url_from_release_notes),
         (('MANUAL', iface_("User Manual"),
-          tip_("The reference manual for this version of Blender")),
+          tip_("The reference manual for this version of Spinner3D")),  # SPINNER3D
          _url_from_manual),
         (('API', iface_("Python API Reference"),
-          tip_("The API reference manual for this version of Blender")),
+          tip_("The API reference manual for this version of Spinner3D")),  # SPINNER3D
          _url_from_api),
 
         # Static URL's.
@@ -1146,10 +1146,10 @@ class WM_OT_url_open_preset(Operator):
           tip_("The donation program to support maintenance and improvements")),
          "https://fund.blender.org"),
         (('BLENDER', "blender.org",
-          tip_("Blender's official web-site")),
+          tip_("Upstream official web-site")),  # SPINNER3D
          "https://www.blender.org"),
         (('CREDITS', iface_("Credits"),
-          tip_("Lists committers to Blender's source code")),
+          tip_("Lists committers to upstream source code")),  # SPINNER3D
          "https://www.blender.org/about/credits/"),
         (('EXTENSIONS', iface_("Extensions Platform"),
           tip_("Online directory of free and open source extensions")),
@@ -3479,7 +3479,7 @@ class WM_MT_splash_quick_setup(Menu):
             col = split.column()
             col.operator(
                 "preferences.copy_prev",
-                text=iface_("Import Blender {:d}.{:d} Preferences", "Operator").format(*old_version),
+                text=iface_("Import Spinner3D {:d}.{:d} Preferences", "Operator").format(*old_version),  # SPINNER3D
                 icon='NONE',
                 translate=False,
             )
@@ -3506,7 +3506,7 @@ class WM_MT_splash_quick_setup(Menu):
         sub = col.column(heading="Theme")
         label = bpy.types.USERPREF_MT_interface_theme_presets.bl_label
         if label == "Presets":
-            label = "Blender Dark"
+            label = "Spinner3D Dark"  # SPINNER3D
         sub.menu("USERPREF_MT_interface_theme_presets", text=label)
 
         col.separator()
@@ -3518,7 +3518,7 @@ class WM_MT_splash_quick_setup(Menu):
         sub = col.column(heading="Keymap")
         text = bpy.path.display_name(kc.name)
         if not text:
-            text = "Blender"
+            text = "Spinner3D"  # SPINNER3D
         sub.menu("USERPREF_MT_keyconfigs", text=text)
 
         if hasattr(kc_prefs, "select_mouse"):
@@ -3663,7 +3663,7 @@ class WM_MT_splash_about(Menu):
         del _ghost_backend, ghost_backend
 
         col.separator(factor=2.0)
-        col.label(text="Blender is free software")
+        col.label(text="Spinner3D is free software")  # SPINNER3D
         col.label(text="Licensed under the GNU General Public License")
 
         col = split.column(align=True)
@@ -3673,8 +3673,8 @@ class WM_MT_splash_about(Menu):
         col.separator(factor=2.0)
         col.operator("wm.url_open_preset", text="Credits", icon='URL').type = 'CREDITS'
         col.operator("wm.url_open", text="License", icon='URL').url = "https://www.blender.org/about/license/"
-        col.operator("wm.url_open", text="Blender Store", icon='URL').url = "https://store.blender.org"
-        col.operator("wm.url_open_preset", text="Blender Website", icon='URL').type = 'BLENDER'
+        col.operator("wm.url_open", text="Upstream Store", icon='URL').url = "https://store.blender.org"  # SPINNER3D
+        col.operator("wm.url_open_preset", text="Upstream Website", icon='URL').type = 'BLENDER'  # SPINNER3D
 
 
 class WM_MT_region_toggle_pie(Menu):
