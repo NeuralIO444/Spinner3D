@@ -1329,6 +1329,10 @@ When requirements for a build option are not met, error instead of disabling the
   OFF
 )
 
+# Spinner3D Rust modules (strangler pattern). Default OFF so upstream merges stay clean.
+option(WITH_SPINNER_RUST "Build Spinner3D Rust modules via Corrosion" OFF)
+mark_as_advanced(WITH_SPINNER_RUST)
+
 if(NOT WITH_BLENDER AND NOT WITH_CYCLES_STANDALONE AND NOT WITH_CYCLES_HYDRA_RENDER_DELEGATE)
   message(FATAL_ERROR
     "At least one of WITH_BLENDER or WITH_CYCLES_STANDALONE "
@@ -2484,6 +2488,10 @@ include(build_files/cmake/testing.cmake)
 # Add Sub-Directories
 
 if(WITH_BLENDER)
+
+# Spinner3D Rust (Corrosion). No-op when WITH_SPINNER_RUST is OFF.
+include(build_files/cmake/spinner_rust.cmake)
+
   add_subdirectory(intern)
   add_subdirectory(extern)
 
