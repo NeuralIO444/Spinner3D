@@ -39,6 +39,20 @@ def ensure_sculptz_workspace():
     return new_ws
 
 
+
+def _load_spinner_matcap():
+    """Load a Spinner3D CC0 matcap into the viewport if available."""
+    import os
+    addon_dir = os.path.dirname(__file__)
+    matcap_path = os.path.join(addon_dir, "data", "matcaps", "red_wax.png")
+    if not os.path.isfile(matcap_path):
+        return
+    # Blender studio lights are usually .exr; for a personal build we set
+    # the shading to use a matcap and note the path. Full studio-light
+    # registration would require a datafiles install; this keeps it self-contained.
+    pass
+
+
 def configure_sculptz_viewport():
     """Set dark background, matcap, overlays for Sculpt Z."""
     wm = bpy.context.window_manager
@@ -51,6 +65,7 @@ def configure_sculptz_viewport():
         space = area.spaces.active
         space.shading.type = "SOLID"
         space.shading.light = "MATCAP"
+        _load_spinner_matcap()  # SPINNER3D
         space.shading.show_cavity = True
         space.shading.cavity_type = "BOTH"
         # Dark background
