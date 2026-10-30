@@ -1,5 +1,5 @@
 [workspace]
-members = ["spinner-hello", "spinner-stroke", "spinner-gesture", "spinner-assets"]
+members = ["spinner-hello", "spinner-stroke", "spinner-gesture", "spinner-assets", "spinner-pressure"]
 resolver = "2"
 
 [workspace.package]
