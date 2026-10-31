@@ -1,0 +1,460 @@
+"""Bodies: the mesh object a sketch's geometry becomes.
+
+A sketch is a Curves object and stays pure source: no modifiers, nothing that
+changes its type. Its geometry is pulled into a *mesh* object, the body, whose
+stack starts by reading the sketch and then converts, extrudes and booleans it.
+
+That split is what makes the result a normal Blender mesh: it can be applied
+(Blender refuses to apply a modifier that changes an object's type, issue #723),
+exported, read with ``to_mesh``, and edited with mesh tools. It also matches how
+parts are structured, since the body is the thing a user grabs and moves: the
+body anchors the part, its workplane hangs under it, and the sketch sits on that
+workplane.
+"""
+
+from typing import Optional
+
+import bpy
+from mathutils import Matrix
+
+# The body's link back to the sketch it reads, so each can find the other without
+# searching every modifier in the file.
+BODY_SKETCH_KEY = "slvs:body_of"
+# Set once a body has been put where the sketch used to stand. A body can exist
+# before that: the file update builds one to carry an old stack, since a Curves
+# object holds only Geometry Nodes modifiers.
+BODY_PLACED_KEY = "slvs:body_placed"
+
+
+def is_body(obj: Optional[bpy.types.Object]) -> bool:
+    """Whether ``obj`` is the mesh a sketch's geometry is realised on."""
+    return bool(obj is not None and obj.type == "MESH" and BODY_SKETCH_KEY in obj)
+
+
+def carrier_of(sketch_obj: Optional[bpy.types.Object]) -> Optional[bpy.types.Object]:
+    """The object that places ``sketch_obj``, whatever kind of sketch it is.
+
+    A sketch never carries its own transform: a 2D one is realised on a mesh
+    body, a free-3D one hangs from an origin Empty. Both are ``slvs_body``, so
+    everything that asks "what moves when this part moves" has one question to
+    ask rather than a special case per kind of sketch.
+    """
+    if sketch_obj is None:
+        return None
+    carrier = sketch_obj.slvs_body
+    if isinstance(carrier, bpy.types.Object):
+        return carrier
+
+    # Free-3D sketches from before the pointer covered them: the origin is the
+    # parent, and says so itself.
+    from ..model.native_3d import SKETCH_3D_ORIGIN_TAG
+
+    parent = sketch_obj.parent
+    if parent is not None and parent.get(SKETCH_3D_ORIGIN_TAG, False):
+        return parent
+    return None
+
+
+def body_of(sketch_obj: Optional[bpy.types.Object]) -> Optional[bpy.types.Object]:
+    """The mesh body that realises ``sketch_obj``, or None if it has none.
+
+    Narrower than :func:`carrier_of`: only a mesh can carry the feature stack,
+    be cut by a boolean, or be exported.
+    """
+    body = carrier_of(sketch_obj)
+    return body if is_body(body) else None
+
+
+def sketch_of(body: Optional[bpy.types.Object]) -> Optional[bpy.types.Object]:
+    """The sketch a body reads, or None."""
+    if not is_body(body):
+        return None
+    sketch = body.get(BODY_SKETCH_KEY)
+    return sketch if isinstance(sketch, bpy.types.Object) else None
+
+
+def ensure_body(
+    context, sketch_obj: bpy.types.Object, name: str = ""
+) -> bpy.types.Object:
+    """Get or create the body that realises ``sketch_obj``.
+
+    Created with the sketch rather than when it first becomes solid, so the part
+    is anchored in the same object from the start: a body appearing later would
+    mean handing the part's root (and its transform) over mid-edit.
+    """
+    from ..model.sketch_ref import is_sketch_object
+
+    assert is_sketch_object(sketch_obj), "ensure_body: not a sketch"
+
+    existing = body_of(sketch_obj)
+    if existing is not None:
+        return existing
+    return _new_body(context, sketch_obj, name)
+
+
+def default_body_name(root: Optional[bpy.types.Object] = None) -> str:
+    """What to call a new body: after the part it joins, else "Part".
+
+    A body that joins no part is the one that roots a new part, so that is what
+    the user is looking at and what it is called: the sketch and its plane are
+    then named after it ("Part Sketch", "Part XY"). A body joining an existing
+    part takes that part's name, which Blender numbers, so "Bracket" gains
+    "Bracket.001" rather than an unrelated "Part.007".
+    """
+    if root is not None and root.name:
+        return root.name
+    return "Part"
+
+
+def _new_body(
+    context, sketch_obj: bpy.types.Object, name: str = ""
+) -> bpy.types.Object:
+    """A bare body bound to ``sketch_obj``: linked, placed, reading the sketch."""
+    from .collections import link_to_scene_root
+    from .curve_data import _ensure_convert_modifier
+
+    name = name or default_body_name()
+    body = bpy.data.objects.new(name, bpy.data.meshes.new(name))
+    body.data.name = body.name  # or the two number themselves apart
+    body[BODY_SKETCH_KEY] = sketch_obj
+    sketch_obj.slvs_body = body
+    link_to_scene_root(body, context.scene)
+
+    # The convert group reads the sketch in the body's local space, so matching
+    # the transforms keeps the geometry planar locally and correct in the world.
+    # Composed from the parent chain rather than read back: ``matrix_world`` is
+    # evaluated state, and a sketch parented a moment ago still reads identity.
+    from .part import world_matrix_of
+
+    body.matrix_basis = world_matrix_of(sketch_obj)
+
+    _ensure_convert_modifier(body)
+    bind_body_to_sketch(body, sketch_obj)
+    return body
+
+
+def name_after_body(body: bpy.types.Object, sketch_obj, plane=None) -> bool:
+    """Name a body's sketch, base planes and mesh after the body.
+
+    The body is the thing the user grabs, so the outliner reads as one named
+    thing with its source under it: rename the body and the rest follows. A
+    ``plane`` is renamed only when the body owns it; one the sketch was drawn on
+    belongs to something else, and an object the user brought along keeps the
+    name they gave it. Returns whether anything was actually renamed.
+
+    Called where a part gains or absorbs something, never from the depsgraph
+    handler: these are the names things are *given* as they are made, not names
+    re-derived on every update, so a name the user types afterwards is theirs
+    and stands.
+    """
+    from .part import PART_PLANE_AXES, PART_PLANE_KEY, existing_part_plane
+    from .workplane import is_managed_workplane
+
+    changed = _rename(body.data, body.name)
+    if sketch_obj is not None:
+        changed |= _rename(sketch_obj, f"{body.name} Sketch")
+        changed |= _rename(sketch_obj.data, sketch_obj.name)
+    if (
+        plane is not None
+        and PART_PLANE_KEY not in plane
+        and is_managed_workplane(plane)
+    ):
+        changed |= _rename(plane, f"{body.name} Workplane")
+    for axis, _euler in PART_PLANE_AXES:
+        base = existing_part_plane(body, axis)
+        if base is not None:
+            changed |= _rename(base, f"{body.name} {axis}")
+    return changed
+
+
+def _rename(datablock, name: str) -> bool:
+    """Give ``datablock`` a name, unless it has it already. True if renamed.
+
+    A name that isn't ours to give is left alone, since assigning it raises:
+    linked and overridden data belongs to the file it came from, and an
+    evaluated copy's name belongs to the depsgraph. A part can hold one of those
+    while the body itself is local (a linked workplane, or a pointer left
+    holding an evaluated object), so it is checked per datablock rather than per
+    body.
+    """
+    if datablock is None or datablock.name == name:
+        return False
+    if not datablock.is_editable or datablock.is_runtime_data:
+        return False
+    datablock.name = name
+    return True
+
+
+def remove_body(sketch_obj: bpy.types.Object) -> None:
+    """Delete the body of a sketch that is going away."""
+    body = body_of(sketch_obj)
+    if body is None:
+        return
+    sketch_obj.slvs_body = None
+    bpy.data.objects.remove(body)
+
+
+def convert_modifier_of(body: Optional[bpy.types.Object]):
+    """``body``'s Convert modifier, or None when it is gone or not wired up.
+
+    Not just "is a modifier named that present": one whose node group was
+    cleared, or that no longer points at the sketch it reads, produces nothing
+    either, and looks the same to the user.
+    """
+    from ..operators.modifiers import get_modifier_input
+    from .convert_nodes import CONVERT_NODE_GROUP, SKETCH_INPUT, input_identifier
+    from .curve_data import CONVERT_MODIFIER_NAME
+
+    if body is None:
+        return None
+    modifier = body.modifiers.get(CONVERT_MODIFIER_NAME)
+    group = getattr(modifier, "node_group", None)
+    if modifier is None or group is None or group.name != CONVERT_NODE_GROUP:
+        return None
+    identifier = input_identifier(group, SKETCH_INPUT)
+    if identifier is None:
+        return None
+    try:
+        # ``==`` not ``is``: bpy hands out a fresh wrapper per access, so two
+        # references to one datablock are never the same Python object.
+        if get_modifier_input(modifier, identifier) != sketch_of(body):
+            return None
+    except Exception:
+        return None
+    return modifier
+
+
+def broken_bodies(scene) -> list:
+    """Bodies whose geometry cannot be built because their Convert setup is gone.
+
+    Deleting that modifier by hand is one click in the modifier panel, and
+    nothing puts it back: the sketch survives untouched while the body it feeds
+    goes empty. Reported so the user can repair it deliberately rather than
+    having it silently reappear (see ``repair_body``).
+    """
+    from .collections import is_editable
+
+    broken = []
+    for obj in scene.objects:
+        if not is_body(obj) or not is_editable(obj):
+            continue
+        if sketch_of(obj) is None:
+            continue  # nothing to read: not this problem
+        if convert_modifier_of(obj) is None:
+            broken.append(obj)
+    return broken
+
+
+def repair_body(context, body: bpy.types.Object) -> bool:
+    """Put ``body``'s Convert modifier back and point it at its sketch."""
+    from .curve_data import _ensure_convert_modifier
+
+    sketch_obj = sketch_of(body)
+    if sketch_obj is None:
+        return False
+    _ensure_convert_modifier(body)
+    bind_body_to_sketch(body, sketch_obj)
+    body.update_tag()
+    return convert_modifier_of(body) is not None
+
+
+def bind_body_to_sketch(body: bpy.types.Object, sketch_obj: bpy.types.Object) -> None:
+    """Point ``body``'s convert modifier at the sketch it is built from."""
+    from ..operators.modifiers import set_modifier_input
+    from .convert_nodes import CONVERT_NODE_GROUP, SKETCH_INPUT, input_identifier
+
+    for modifier in body.modifiers:
+        group = getattr(modifier, "node_group", None)
+        if modifier.type != "NODES" or group is None:
+            continue
+        if group.name != CONVERT_NODE_GROUP:
+            continue
+        identifier = input_identifier(group, SKETCH_INPUT)
+        if identifier is not None:
+            set_modifier_input(modifier, identifier, sketch_obj)
+
+
+def _copy_modifier(source, body: bpy.types.Object):
+    """Recreate one of a legacy sketch's modifiers on its body.
+
+    Any type, not only Geometry Nodes: a file can carry a modifier the user
+    added themselves, and an older one carries what the file update translated.
+    """
+    from ..operators.modifiers import copy_modifier
+
+    return copy_modifier(source, body)
+
+
+def _redirect_to_body(scene, sketch_obj: bpy.types.Object, body: bpy.types.Object):
+    """Point everything that referenced the sketch's *geometry* at its body.
+
+    A file written before the split used the sketch object as the body, so other
+    parts' booleans cut with it and face anchors were stamped from it. Those mean
+    the mesh, which is now a different object.
+    """
+    from ..operators.modifiers import (
+        boolean_input_ids,
+        get_modifier_input,
+        set_modifier_input,
+    )
+    from .boolean_nodes import BOOLEAN_NODE_GROUP
+    from .face_anchor import KEY_SOURCE
+
+    for obj in scene.objects:
+        if obj.get(KEY_SOURCE) == sketch_obj:
+            obj[KEY_SOURCE] = body
+        for modifier in obj.modifiers:
+            group = getattr(modifier, "node_group", None)
+            if modifier.type != "NODES" or group is None:
+                continue
+            if group.name != BOOLEAN_NODE_GROUP:
+                continue
+            # A linked group cannot be rebuilt to the current interface, so it
+            # may not have the socket at all: leave such a modifier alone rather
+            # than failing the whole update.
+            cutter_id = boolean_input_ids(group).get("Cutter")
+            if cutter_id is None:
+                continue
+            if get_modifier_input(modifier, cutter_id) == sketch_obj:
+                set_modifier_input(modifier, cutter_id, body)
+
+
+def _inherit_visibility(sketch_obj: bpy.types.Object, body: bpy.types.Object) -> None:
+    """Give the body the visibility its sketch object had before the split.
+
+    In old files the sketch object carried the modifiers, so hiding it hid the
+    result. The body is that result now, and a part the user had put away has to
+    stay away: created visible it pops back into the scene on update.
+    """
+    body.hide_viewport = sketch_obj.hide_viewport
+    body.hide_render = sketch_obj.hide_render
+    try:
+        body.hide_set(sketch_obj.hide_get())
+    except RuntimeError:
+        pass  # one of them is not in this view layer
+
+
+def _rehome_onto_body(context, sketch_obj: bpy.types.Object, body: bpy.types.Object):
+    """Put the body where the sketch used to sit in the hierarchy.
+
+    The body becomes what carries the part: a sketch that was its own plane gets
+    one (minted where it stood), and a sketch already placed by a plane keeps it,
+    with the body hanging from that plane as a new sketch's would.
+    """
+    from ..operators.add_sketch import new_workplane_empty
+    from .part import clear_part_root, fix_transform, is_part_root, mark_part_root
+
+    was_root = is_part_root(sketch_obj)
+    children = list(sketch_obj.children)
+    plane = sketch_obj.slvs_workplane
+
+    if plane is None:
+        # The sketch was its own plane: mint one where it stands, and let it ride
+        # on the body, which now carries the transform.
+        plane = new_workplane_empty(context, sketch_obj.matrix_world.copy())
+        owns_plane = True
+        body.matrix_basis = sketch_obj.matrix_world.copy()
+        plane.parent = body
+        plane.matrix_parent_inverse = Matrix.Identity(4)
+        plane.matrix_basis = Matrix.Identity(4)
+    else:
+        # It was placed by a plane already: the body hangs from that plane, the
+        # way a new sketch's body does.
+        owns_plane = False
+        body.parent = plane
+        body.matrix_parent_inverse = Matrix.Identity(4)
+        body.matrix_basis = Matrix.Identity(4)
+
+    sketch_obj.parent = plane
+    sketch_obj.slvs_workplane = plane
+    sketch_obj.matrix_parent_inverse = Matrix.Identity(4)
+    sketch_obj.matrix_basis = Matrix.Identity(4)
+    fix_transform(sketch_obj)
+    fix_transform(plane)
+
+    # Whatever hung from the sketch belonged to the part, which the body now
+    # anchors: its own plane excepted, that is where those go.
+    for child in children:
+        if child in (plane,):
+            continue
+        child.parent = body
+
+    # The body took over the sketch's place, so it takes its name too: whatever
+    # the user called the part in the old file stays on the thing they now grab.
+    # The sketch has to let go of the name first, or the body gets a numbered one.
+    taken = sketch_obj.name
+    sketch_obj.name = f"{taken}.source"
+    body.name = taken
+    body.data.name = body.name
+    name_after_body(body, sketch_obj, plane if owns_plane else None)
+
+    if was_root:
+        clear_part_root(sketch_obj)
+        mark_part_root(body)
+
+
+def migrate_bodies(context, scene) -> bool:
+    """Give every sketch in an older file the body its geometry belongs on.
+
+    Files written before the split used the sketch object itself as the body, so
+    its modifiers changed a Curves object into a mesh: that is what stops the
+    stack being applied (issue #723). The stack moves to a real mesh, the sketch
+    keeps only its curves, and everything that referred to the sketch's geometry
+    is pointed at the body instead.
+
+    Idempotent: a sketch whose body has been put in place is left alone. A body
+    that exists but has not been placed is one the file update built to carry an
+    old modifier stack; it still needs its place here.
+    """
+    from .. import global_data
+
+    changed = False
+    global_data.migrating_bodies = True
+    try:
+        changed = _migrate_bodies(context, scene)
+    finally:
+        global_data.migrating_bodies = False
+    return changed
+
+
+def _migrate_bodies(context, scene) -> bool:
+    """The conversion itself; see :func:`migrate_bodies`."""
+    from ..model.sketch_ref import get_sketches, hide_sketch_curves
+    from .collections import is_editable
+
+    changed = False
+    for sketch in list(get_sketches(scene)):
+        sketch_obj = sketch.target_object
+        if not is_editable(sketch_obj):
+            continue
+        body = body_of(sketch_obj)
+        if body is not None and body.get(BODY_PLACED_KEY):
+            continue
+        if body is not None and not sketch_obj.modifiers:
+            # The split this pass performs has already happened: the stack lives
+            # on the body and the sketch is pure curves. Files written before the
+            # flag was stamped at creation reach here once; marking them keeps
+            # running the update on a current file the no-op it claims to be
+            # (unmarked, it renamed the body after the sketch on every run).
+            body[BODY_PLACED_KEY] = True
+            continue
+        if body is None:
+            body = _new_body(context, sketch_obj)
+        # The sketch's own convert modifier carries the settings the file was
+        # drawn with, so it replaces the fresh one the body was given.
+        for modifier in list(body.modifiers):
+            body.modifiers.remove(modifier)
+        for modifier in list(sketch_obj.modifiers):
+            _copy_modifier(modifier, body)
+            sketch_obj.modifiers.remove(modifier)
+        bind_body_to_sketch(body, sketch_obj)
+
+        _redirect_to_body(scene, sketch_obj, body)
+        _rehome_onto_body(context, sketch_obj, body)
+        body[BODY_PLACED_KEY] = True
+        _inherit_visibility(sketch_obj, body)
+        # What the user sees is the body now; the curves would only double it.
+        hide_sketch_curves(sketch_obj)
+        changed = True
+
+    return changed

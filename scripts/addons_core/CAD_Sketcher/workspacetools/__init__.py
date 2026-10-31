@@ -1,0 +1,149 @@
+from ..declarations import WorkSpaceTools
+from . import manager
+from .add_arc2d import VIEW3D_T_slvs_add_arc2d, VIEW3D_T_slvs_add_arc3pt2d
+from .add_circle2d import VIEW3D_T_slvs_add_circle2d
+from .add_dimension import VIEW3D_T_slvs_add_dimension
+from .add_line2d import VIEW3D_T_slvs_add_line2d
+from .add_line3d import VIEW3D_T_slvs_add_line3d
+from .add_point2d import VIEW3D_T_slvs_add_point2d
+from .add_point3d import VIEW3D_T_slvs_add_point3d
+from .add_rectangle import (
+    VIEW3D_T_slvs_add_rectangle,
+    VIEW3D_T_slvs_add_rectangle_3point,
+    VIEW3D_T_slvs_add_rectangle_center,
+)
+from .add_sketch import VIEW3D_T_slvs_add_sketch
+from .array_circular import VIEW3D_T_slvs_node_array_circular
+from .array_linear import VIEW3D_T_slvs_node_array_linear
+from .bevel import VIEW3D_T_slvs_bevel
+from .extrude import VIEW3D_T_slvs_node_extrude
+from .manager import ToolGroup, add
+from .offset import VIEW3D_T_slvs_offset
+from .project_geometry import VIEW3D_T_slvs_project_geometry
+from .revolve import VIEW3D_T_slvs_node_revolve
+from .select import VIEW3D_T_slvs_select
+from .trim import VIEW3D_T_slvs_trim
+
+# 2D sketch tools.
+add(VIEW3D_T_slvs_select, visibility=ToolGroup.SKETCH_2D, separator=True, group=False)
+add(
+    VIEW3D_T_slvs_add_point2d,
+    visibility=ToolGroup.SKETCH_2D,
+    separator=True,
+    group=False,
+)
+add(
+    VIEW3D_T_slvs_add_line2d,
+    visibility=ToolGroup.SKETCH_2D,
+    separator=False,
+    group=False,
+)
+add(
+    VIEW3D_T_slvs_add_circle2d,
+    visibility=ToolGroup.SKETCH_2D,
+    separator=False,
+    group=False,
+)
+# Both arc tools share one toolbar button with a flyout, the 3-point arc leading:
+# it draws from the cursor's own direction, so it needs no center to start from.
+add(
+    VIEW3D_T_slvs_add_arc3pt2d,
+    visibility=ToolGroup.SKETCH_2D,
+    separator=False,
+    group=True,
+)
+add(
+    VIEW3D_T_slvs_add_arc2d,
+    visibility=ToolGroup.SKETCH_2D,
+    after={WorkSpaceTools.AddArc3Point2D.value},
+)
+# The rectangle variants share one toolbar button with a flyout.
+add(
+    VIEW3D_T_slvs_add_rectangle,
+    visibility=ToolGroup.SKETCH_2D,
+    separator=False,
+    group=True,
+)
+add(
+    VIEW3D_T_slvs_add_rectangle_center,
+    visibility=ToolGroup.SKETCH_2D,
+    after={WorkSpaceTools.AddRectangle.value},
+)
+add(
+    VIEW3D_T_slvs_add_rectangle_3point,
+    visibility=ToolGroup.SKETCH_2D,
+    after={WorkSpaceTools.AddRectangleCenter.value},
+)
+add(VIEW3D_T_slvs_trim, visibility=ToolGroup.SKETCH_2D, separator=True, group=False)
+add(VIEW3D_T_slvs_bevel, visibility=ToolGroup.SKETCH_2D, separator=False, group=False)
+add(VIEW3D_T_slvs_offset, visibility=ToolGroup.SKETCH_2D, separator=False, group=False)
+add(
+    VIEW3D_T_slvs_project_geometry,
+    visibility=ToolGroup.SKETCH_2D,
+    separator=True,
+    group=False,
+)
+add(
+    VIEW3D_T_slvs_add_dimension,
+    visibility=ToolGroup.SKETCH_2D,
+    separator=True,
+    group=False,
+)
+
+# Native free-3D sketch tools. Keep this first slice intentionally small:
+# selection plus point/line placement on stateful temporary planes.
+add(VIEW3D_T_slvs_select, visibility=ToolGroup.SKETCH_3D, separator=True, group=False)
+add(
+    VIEW3D_T_slvs_add_point3d,
+    visibility=ToolGroup.SKETCH_3D,
+    separator=True,
+    group=False,
+)
+add(
+    VIEW3D_T_slvs_add_line3d,
+    visibility=ToolGroup.SKETCH_3D,
+    separator=False,
+    group=False,
+)
+
+# Non-sketch tools (visible when no sketch is active). The free-3D sketch has no
+# toolbar entry -- it is created from the "Add Sketch" dropdown in the sidebar.
+add(
+    VIEW3D_T_slvs_add_sketch,
+    visibility=ToolGroup.NON_SKETCH,
+    separator=True,
+    group=False,
+)
+add(
+    VIEW3D_T_slvs_node_extrude,
+    visibility=ToolGroup.NON_SKETCH,
+    separator=True,
+    group=False,
+)
+add(
+    VIEW3D_T_slvs_node_revolve,
+    visibility=ToolGroup.NON_SKETCH,
+    separator=False,
+    group=False,
+)
+# Both array tools share one toolbar button with a flyout, the linear one
+# leading: it needs no axis, so it is the simpler of the two to reach for.
+add(
+    VIEW3D_T_slvs_node_array_linear,
+    visibility=ToolGroup.NON_SKETCH,
+    separator=False,
+    group=True,
+)
+add(
+    VIEW3D_T_slvs_node_array_circular,
+    visibility=ToolGroup.NON_SKETCH,
+    after={WorkSpaceTools.ArrayLinear.value},
+)
+
+
+def register():
+    manager.register()
+
+
+def unregister():
+    manager.unregister()

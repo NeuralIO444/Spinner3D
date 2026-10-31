@@ -1,0 +1,146 @@
+import logging
+import math
+
+from bpy.props import BoolProperty, FloatProperty, StringProperty
+from bpy.types import PropertyGroup
+from bpy.utils import register_classes_factory
+from mathutils import Matrix, Vector
+
+from ..curve_solver import Solver
+from ..global_data import WpReq
+from ..utilities.math import pol2cart
+from ..utilities.solver import update_system_cb
+from ..utilities.view import get_2d_coords
+from .base_constraint import DimensionalConstraint
+from .categories import CURVE
+from .utilities import slvs_entity_pointer
+
+logger = logging.getLogger(__name__)
+
+
+class SlvsDiameter(DimensionalConstraint, PropertyGroup):
+    """Sets the diameter of an arc or a circle."""
+
+    def _set_value_force(self, value):
+        # A size has no sign, so a negative one is a sign slip: take its
+        # magnitude, as a distance does. Clamping to 0 instead would answer a
+        # mistyped radius with a degenerate zero-radius circle.
+        DimensionalConstraint._set_value_force(self, abs(value))
+
+    def use_radius_getter(self):
+        return self.setting_store
+
+    def use_radius_setter(self, setting):
+        old_setting = self.setting_store
+        self.setting_store = setting
+
+        distance = None
+        if old_setting and not setting:
+            distance = self.value * 2
+        elif not old_setting and setting:
+            distance = self.value / 2
+
+        if distance is not None:
+            self._set_value_force(distance)
+
+    @property
+    def label(self):
+        return "Radius" if self.setting else "Diameter"
+
+    value_store: FloatProperty(
+        name="Size Storage",
+        subtype="DISTANCE",
+        unit="LENGTH",
+        precision=6,
+    )
+    value: FloatProperty(
+        name="Size",
+        subtype="DISTANCE",
+        unit="LENGTH",
+        precision=6,
+        get=DimensionalConstraint._get_value,
+        set=DimensionalConstraint._set_value,
+        update=update_system_cb,
+    )
+    setting_store: BoolProperty(name="Use Radius Storage", default=False)
+    setting: BoolProperty(
+        name="Use Radius", get=use_radius_getter, set=use_radius_setter
+    )
+    leader_angle: FloatProperty(name="Leader Angle", default=45, subtype="ANGLE")
+    draw_offset: FloatProperty(name="Draw Offset", default=0)
+    type = "DIAMETER"
+    signature = (CURVE,)
+    props = ("value",)
+
+    @property
+    def diameter(self):
+        value = self.value
+        if self.setting:
+            return value * 2
+        return value
+
+    @property
+    def radius(self):
+        value = self.value
+        if self.setting:
+            return value
+        return value / 2
+
+    curve_id_1: StringProperty(name="Curve ID 1", default="")
+
+    def create_slvs_data_from_curves(self, solvesys, handle_map, wp, group):
+        h1 = handle_map.get(self.curve_id_1)
+        if h1 is None:
+            return None
+        return solvesys.diameter(group, h1, self.diameter)
+
+    def needs_wp(self):
+        return WpReq.OPTIONAL
+
+    def create_slvs_data(self, solvesys, group=Solver.group_fixed):
+        return solvesys.diameter(group, self.entity1.py_data, self.diameter)
+
+    def _get_init_value(self, setting):
+        r = self.ref(1)
+        # Unresolved reference (e.g. legacy files before migration) — no measure.
+        if r is None or not r.valid:
+            return 0.0
+        value = r.radius
+        if not setting:
+            return value * 2
+        return value
+
+    def init_props(self, **kwargs):
+        setting = kwargs.get("setting", self.setting)
+        value = kwargs.get("value", self._get_init_value(setting))
+        # setting must be set before value to avoid use_radius_setter halving it
+        return {"setting": setting, "value": value}
+
+    def matrix_basis(self):
+        r = self.ref(1)
+        if not r or not r.is_curve():
+            return Matrix()
+        mat_local = Matrix.Translation(r.ct.co.to_3d())
+        return r.wp_matrix @ mat_local
+
+    def text_inside(self):
+        return self.draw_offset < self.radius
+
+    def update_draw_offset(self, pos, ui_scale):
+        self.draw_offset = pos.length
+        self.leader_angle = math.atan2(pos.y, pos.x)
+
+    def value_placement(self, context, basis=None):
+        """location to display the constraint value"""
+        offset = self.draw_offset
+        coords = pol2cart(offset, self.leader_angle)
+        if basis is None:
+            basis = self.matrix_basis()
+        coords2 = basis @ Vector((coords[0], coords[1], 0.0))
+        return get_2d_coords(context, coords2)
+
+
+slvs_entity_pointer(SlvsDiameter, "entity1")
+slvs_entity_pointer(SlvsDiameter, "sketch")
+
+register, unregister = register_classes_factory((SlvsDiameter,))

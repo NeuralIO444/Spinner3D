@@ -1,0 +1,132 @@
+import bpy
+from bpy.types import Context
+
+from .. import declarations, icon_manager
+from ..model import types
+from ..stateful_operator import constants
+from ..utilities import preferences
+from .feature_list import VIEW3D_UL_features
+from .panels.constraints_list import VIEW3D_PT_sketcher_constraints
+from .panels.custom_attributes import VIEW3D_PT_sketcher_custom_attributes
+from .panels.debug import VIEW3D_PT_sketcher_debug
+from .panels.entities_list import VIEW3D_PT_sketcher_entities
+from .panels.sketch_select import (
+    VIEW3D_MT_slvs_add_sketch,
+    VIEW3D_MT_slvs_part_sketches,
+    VIEW3D_MT_slvs_sketch_workplane,
+    VIEW3D_PT_sketcher,
+)
+from .panels.tools import VIEW3D_PT_sketcher_tools
+from .part_menu import (
+    VIEW3D_MT_slvs_part,
+    draw_part_menu,
+    draw_part_menu_in_object_menu,
+)
+from .selected_menu import VIEW3D_MT_selected_menu
+
+
+def draw_object_context_menu(self, context: Context):
+    from ..model.sketch_ref import is_sketch_object
+    from ..utilities.part import part_root_of
+    from .panels.sketch_select import part_sketches
+
+    layout = self.layout
+    ob = context.active_object
+
+    # Resolve what was clicked to a part: right-clicking a body should reach the
+    # sketches that made it, including the cutters, which are hidden while they
+    # cut and so cannot be clicked themselves.
+    root = part_root_of(ob) if ob else None
+    sketches = part_sketches(context, root) if root is not None else []
+
+    if len(sketches) > 1:
+        layout.menu(declarations.Menus.PartSketches.value, text="Edit Sketch")
+    else:
+        row = layout.row()
+        props = row.operator(declarations.Operators.SetActiveSketch, text="Edit Sketch")
+        target = (
+            sketches[0] if sketches else (ob if ob and is_sketch_object(ob) else None)
+        )
+        if target is not None:
+            row.enabled = True
+            props.sketch_name = target.name
+        else:
+            row.enabled = False
+
+    draw_part_menu(self, context)
+    layout.separator()
+
+
+def draw_add_sketch_in_add_menu(self, context: Context):
+    from ..declarations import Operators, WorkSpaceTools
+    from ..stateful_operator.constants import Operators as StatefulOps
+
+    self.layout.separator()
+    self.layout.operator_context = "INVOKE_DEFAULT"
+    # Switch to the Add Sketch tool (workplane gizmo), then invoke the operator.
+    props = self.layout.operator(StatefulOps.InvokeTool.value, text="Sketch")
+    props.tool_name = WorkSpaceTools.AddSketch.value
+    props.operator = Operators.AddSketch.value
+
+
+def draw_sketch_header(self, context: Context):
+    from ..model.sketch_ref import get_active_sketch
+
+    sketch = get_active_sketch(context)
+    if not sketch:
+        return
+    layout = self.layout
+    row = layout.row(align=True)
+    row.separator()
+    row.label(text=sketch.target_object.name)
+    row.operator(
+        declarations.Operators.SetActiveSketch, text="Leave Sketch", icon="BACK"
+    ).sketch_name = ""
+
+
+classes = [
+    VIEW3D_UL_features,
+    VIEW3D_PT_sketcher,
+    VIEW3D_PT_sketcher_tools,
+    VIEW3D_PT_sketcher_entities,
+    VIEW3D_PT_sketcher_constraints,
+    VIEW3D_PT_sketcher_custom_attributes,
+    VIEW3D_PT_sketcher_debug,
+    VIEW3D_MT_selected_menu,
+    VIEW3D_MT_slvs_add_sketch,
+    VIEW3D_MT_slvs_sketch_workplane,
+    VIEW3D_MT_slvs_part_sketches,
+    VIEW3D_MT_slvs_part,
+]
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+    from .selected_menu import register_props
+
+    register_props()
+
+    bpy.types.VIEW3D_MT_object_context_menu.prepend(draw_object_context_menu)
+    bpy.types.VIEW3D_MT_add.append(draw_add_sketch_in_add_menu)
+    bpy.types.VIEW3D_HT_header.append(draw_sketch_header)
+    # A hidden cutter can only be reached from the outliner, and the header's
+    # Object menu is where a command is looked for when the click was missed.
+    bpy.types.OUTLINER_MT_object.append(draw_part_menu)
+    bpy.types.VIEW3D_MT_object.append(draw_part_menu_in_object_menu)
+
+
+def unregister():
+    from .selected_menu import unregister_props
+
+    unregister_props()
+
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+    bpy.types.VIEW3D_HT_header.remove(draw_sketch_header)
+    bpy.types.VIEW3D_MT_object_context_menu.remove(draw_object_context_menu)
+    bpy.types.VIEW3D_MT_add.remove(draw_add_sketch_in_add_menu)
+    bpy.types.OUTLINER_MT_object.remove(draw_part_menu)
+    bpy.types.VIEW3D_MT_object.remove(draw_part_menu_in_object_menu)

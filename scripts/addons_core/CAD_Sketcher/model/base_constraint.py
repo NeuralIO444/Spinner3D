@@ -1,0 +1,568 @@
+import logging
+import math
+from contextlib import contextmanager
+from typing import List, Optional
+
+import bpy
+from bpy.props import BoolProperty, StringProperty
+from bpy.types import Context, Property, UILayout
+
+from ..global_data import WpReq
+from ..utilities import preferences
+from ..utilities.bpy import setprop
+from ..utilities.solver import update_system_cb
+from ..utilities.view import refresh, update_cb
+from .base_entity import SlvsGenericEntity
+from .constants import ENTITY_PROP_NAMES
+
+logger = logging.getLogger(__name__)
+
+
+# The sketch currently being solved, published by the solver so the constraints it
+# is building do not each re-derive it. A constraint has no back-pointer to its
+# sketch, so _get_sketch resolves one from its id_data -- several times per
+# constraint, ~2800 times per solve on a 400-constraint sketch, which is 21% of
+# the solve even with the owner lookup cached.
+_sketch_resolution_override = None
+
+
+@contextmanager
+def sketch_resolution(sketch):
+    """Publish ``sketch`` as the answer for its own constraints while active.
+
+    Honoured only for a constraint whose ``id_data`` *is* this sketch's data, so
+    it can never resolve a constraint to the wrong sketch: anything from elsewhere
+    falls through to the normal lookup. Re-entrant, and restores the previous
+    value, so a nested solve of another sketch behaves.
+    """
+    global _sketch_resolution_override
+    previous = _sketch_resolution_override
+    _sketch_resolution_override = sketch
+    try:
+        yield
+    finally:
+        _sketch_resolution_override = previous
+
+
+# Curves datablock name -> the Object that owns it.
+#
+# Resolving the owner by scanning bpy.data.objects is O(scene), and _get_sketch
+# runs several times per constraint per solve (700 times for 100 constraints), so
+# the scan made solve time scale with how many *unrelated* objects the file
+# contained: one identical sketch solved 8x slower in a 1000-object scene than in
+# an empty one.
+#
+# The cache holds the Object itself, not its name: ``bpy.data.objects.get(name)``
+# is ALSO a linear scan (0.8us at 10 objects, 49us at 2000), so looking the owner
+# up by name would keep the very cost this removes.
+_data_owner_cache = {}
+
+
+def reset_data_owner_cache():
+    """Drop the datablock-owner cache (e.g. on file load)."""
+    _data_owner_cache.clear()
+
+
+def _resolve_data_owner(id_data):
+    """The Object whose data is ``id_data``, or ``None``.
+
+    Correctness does not rely on the cache being fresh: a cached Object is
+    *verified* to still own ``id_data`` under the same conditions the scan accepts
+    (identity, or a name match -- evaluated data has a different identity than its
+    original, which is why the name fallback exists). A stale entry therefore
+    costs a rescan and can never return the wrong object. Blender invalidates
+    references to removed IDs, so reading one raises rather than returning garbage.
+    """
+    import bpy
+
+    cached = _data_owner_cache.get(id_data.name)
+    if cached is not None:
+        try:
+            data = cached.data
+        except ReferenceError:  # the object was removed since we cached it
+            del _data_owner_cache[id_data.name]
+        else:
+            if data is id_data or (data is not None and data.name == id_data.name):
+                return cached
+
+    for obj in bpy.data.objects:
+        if obj.data is id_data:
+            _data_owner_cache[id_data.name] = obj
+            return obj
+    for obj in bpy.data.objects:
+        if obj.data and obj.data.name == id_data.name:
+            _data_owner_cache[id_data.name] = obj
+            return obj
+    return None
+
+
+class GenericConstraint:
+    if bpy.app.version >= (5, 0):
+
+        def _name_get_transform(self, curr_value, is_set):
+            return curr_value if is_set else str(self)
+
+        name: StringProperty(name="Name", get_transform=_name_get_transform)
+    else:
+
+        def _name_getter(self):
+            return self.get("name", str(self))
+
+        def _name_setter(self, new_name):
+            self["name"] = new_name
+
+        name: StringProperty(name="Name", get=_name_getter, set=_name_setter)
+    failed: BoolProperty(name="Failed")
+    constraint_uid: StringProperty(name="Constraint UID", default="")
+    visible: BoolProperty(name="Visible", default=True, update=update_cb)
+    is_reference = False  # Only DimensionalConstraint can be reference
+    signature = ()
+    props = ()
+    swappable = False
+
+    def needs_wp(args):
+        return WpReq.OPTIONAL
+
+    def __str__(self):
+        return self.label
+
+    def get_workplane(self):
+        # NOTE: this could also check through the constraints entity workplanes
+        needs_wp = self.needs_wp()
+
+        workplane = None
+        if self.sketch_i != -1 and self.sketch:
+            workplane = self.sketch.wp
+
+        if workplane and needs_wp != WpReq.FREE:
+            return workplane.py_data
+        elif needs_wp == WpReq.NOT_FREE:
+            return None
+        else:
+            import slvs
+
+            return slvs.E_FREE_IN_3D
+
+    def entities(self):
+        props = []
+        for prop_name in dir(self):
+            if prop_name.endswith("_i") or not prop_name.startswith("entity"):
+                continue
+            entity = getattr(self, prop_name)
+            if not entity:
+                continue
+            props.append(entity)
+        return props
+
+    def dependencies(self) -> List[SlvsGenericEntity]:
+        deps = self.entities()
+        if hasattr(self, "sketch"):
+            s = self.sketch
+            if s:
+                deps.append(s)
+        return deps
+
+    # TODO: avoid duplicating code
+    def update_pointers(self, index_old, index_new):
+        def _update(name):
+            prop = getattr(self, name)
+            if prop == index_old:
+                logger.debug(
+                    "Update reference {} of {} to {}: ".format(name, self, index_new)
+                )
+                setattr(self, name, index_new)
+
+        if hasattr(self, "sketch_i"):
+            _update("sketch_i")
+
+        for prop_name in dir(self):
+            if not prop_name.startswith("entity") or not prop_name.endswith("_i"):
+                continue
+            _update(prop_name)
+
+    def is_visible(self, context):
+        if hasattr(self, "sketch"):
+            return self.sketch.is_visible(context) and self.visible
+        return self.visible
+
+    def is_orphan(self):
+        """Check if this constraint's sketch object has been deleted."""
+        import bpy
+
+        c_sketch_name = self.get("_sketch_object", "")
+        if c_sketch_name:
+            return bpy.data.objects.get(c_sketch_name) is None
+        return False
+
+    def is_active(self, active_sketch):
+        if self.is_orphan():
+            return False
+
+        if not hasattr(self, "sketch"):
+            return not active_sketch
+
+        show_inactive = not preferences.use_experimental(
+            "hide_inactive_constraints", True
+        )
+        if show_inactive:
+            return True
+
+        # Compare by sketch object name (new) or entity pointer (legacy)
+        c_sketch_name = self.get("_sketch_object", "")
+        if c_sketch_name and active_sketch:
+            active_obj = (
+                active_sketch.target_object
+                if hasattr(active_sketch, "target_object")
+                else active_sketch
+            )
+            if active_obj:
+                return c_sketch_name == active_obj.name
+        return self.sketch == active_sketch
+
+    def draw_plane(self):
+        from mathutils import Vector
+
+        sketch = self._get_sketch() if hasattr(self, "_get_sketch") else None
+        if not sketch and self.sketch_i != -1 and self.sketch:
+            sketch = self.sketch
+
+        if sketch:
+            mat = getattr(sketch, "plane_matrix", None)
+            if mat is not None:
+                return mat.translation.copy(), Vector(mat.col[2][:3]).normalized()
+            wp = getattr(sketch, "wp", None)
+            if wp:
+                return wp.p1.location, wp.normal
+
+        # TODO: return drawing plane for constraints in 3d
+        return None, None
+
+    def copy(self, context, entities):
+        # copy itself to another set of entities
+        from .sketch_ref import get_active_constraints
+
+        c = get_active_constraints(context).new_from_type(self.type)
+        if hasattr(self, "sketch"):
+            c.sketch = self.sketch
+        if hasattr(self, "setting"):
+            c.setting = self.setting
+        if hasattr(self, "value"):
+            c.value = self.value
+
+        for prop, e in zip(ENTITY_PROP_NAMES, entities):
+            setattr(c, prop, e)
+
+        return c
+
+    def draw_props(self, layout: UILayout):
+        is_experimental = preferences.is_experimental()
+
+        layout.prop(self, "name", text="")
+
+        if self.failed:
+            layout.label(text="Failed", icon="ERROR")
+
+        # Info block
+        if is_experimental:
+            layout.separator()
+            sub = layout.column()
+            sub.scale_y = 0.8
+            sub.label(text="Dependencies:")
+            for e in self.dependencies():
+                sub.label(text=str(e))
+
+        # General props. One gap here and none after: what a subclass adds
+        # belongs with these rather than floating below a second separator.
+        layout.separator()
+        layout.prop(self, "visible")
+
+        return layout
+
+    def index(self):
+        """Return elements index inside its collection"""
+        # HACK: Elements of collectionproperties currently don't expose an index
+        # method, path_from_id writes the index however, use this hack instead
+        # of looping over elements
+        return int(self.path_from_id().split("[")[1].split("]")[0])
+
+    def placements(self):
+        """Return the entities where the constraint should be displayed"""
+        return []
+
+    def curve_id_placements(self):
+        """Return curve_ids where the constraint should be displayed.
+
+        Default: returns curve_id_1 (and curve_id_2/3 if set).
+        Override for constraints with special placement logic.
+        """
+        ids = []
+        if getattr(self, "curve_id_1", ""):
+            ids.append(self.curve_id_1)
+        if getattr(self, "curve_id_2", ""):
+            ids.append(self.curve_id_2)
+        if getattr(self, "curve_id_3", ""):
+            ids.append(self.curve_id_3)
+        return ids
+
+    def marker_position(self, sketch):
+        """World position for a single constraint marker, or None.
+
+        Override to place the gizmo icon at a computed point (e.g. a tangent
+        point) instead of a curve's default placement. Returning None makes the
+        gizmo fall back to ``curve_id_placements``.
+        """
+        return None
+
+    def solver_signature(self):
+        return self.signature
+
+    def _signature_ids(self):
+        return [
+            getattr(self, "curve_id_%d" % (i + 1), "")
+            for i in range(len(self.signature))
+        ]
+
+    def accepts_curve_types(self, sketch):
+        """Whether the referenced curves have types this constraint can solve."""
+        from ..utilities.curve_data import get_curve_type
+        from .types import (
+            SlvsArc,
+            SlvsCircle,
+            SlvsLine2D,
+            SlvsLine3D,
+            SlvsPoint2D,
+            SlvsPoint3D,
+        )
+
+        classes = {
+            0: (SlvsPoint2D, SlvsPoint3D),
+            1: (SlvsLine2D, SlvsLine3D),
+            2: (SlvsArc,),
+            3: (SlvsCircle,),
+        }
+        types = [
+            get_curve_type(sketch, cid) if cid else None
+            for cid in self._signature_ids()
+        ]
+
+        def fits(order):
+            for allowed, t in zip(self.solver_signature(), order):
+                if t is None:
+                    continue
+                if not any(cls in allowed for cls in classes.get(t, ())):
+                    return False
+            return True
+
+        if fits(types):
+            return True
+        return self.swappable and len(types) == 2 and fits(types[::-1])
+
+    def _get_sketch(self):
+        """Resolve the Sketch accessor for this constraint."""
+        sketch = self.sketch if hasattr(self, "sketch") and self.sketch else None
+        if sketch:
+            return sketch
+
+        id_data = getattr(self, "id_data", None)
+
+        # The solver publishes the sketch it is building; accept it only when this
+        # constraint really belongs to that sketch's data.
+        override = _sketch_resolution_override
+        if override is not None and id_data is not None:
+            obj = override.target_object
+            if obj is not None and obj.data is id_data:
+                return override
+
+        # Resolve from Curves id_data (native curves path)
+        import bpy
+
+        if id_data and hasattr(id_data, "sketch_constraints"):
+            obj = _resolve_data_owner(id_data)
+            if obj is not None:
+                from .sketch_ref import Sketch
+
+                return Sketch(obj)
+        # Last resort: use active sketch from context
+        from .sketch_ref import get_active_sketch
+
+        return get_active_sketch(bpy.context)
+
+    def ref(self, n=1):
+        """Return a typed CurveRef for curve_id_N, or None if unset."""
+        cid = getattr(self, f"curve_id_{n}", "")
+        if not cid:
+            return None
+        sketch = self._get_sketch()
+        if not sketch:
+            return None
+        from .curve_ref import curve_ref
+
+        return curve_ref(sketch, cid)
+
+    def create_slvs_data(self, solvesys, **kwargs):
+        raise NotImplementedError()
+
+    def py_data(self, solvesys, **kwargs):
+        return self.create_slvs_data(solvesys, **kwargs)
+
+
+class DimensionalConstraint(GenericConstraint):
+    value: Property
+    setting: BoolProperty
+
+    def _set_value(self, displayed_value: float):
+        # NOTE: function signature _set_value(self, val: float, force=False)
+        #       will fail when bpy tries to register the value property.
+        #       See `_set_value_force()`
+        if not self.is_reference and math.isfinite(displayed_value):
+            self._set_value_force(self.from_displayed_value(displayed_value))
+
+    def _get_scene(self):
+        import bpy
+
+        return bpy.context.scene
+
+    def value_key(self) -> Optional[str]:
+        """The scene custom property holding this constraint's value, if any."""
+        uid = getattr(self, "constraint_uid", "")
+        return f"slvs:c:{uid}" if uid else None
+
+    def stored_value(self) -> Optional[float]:
+        """The value kept on the constraint itself, or None when unset.
+
+        ``value_store`` mirrors the scene property so the number travels with
+        the sketch: a scene key is left behind when the sketch is linked or
+        appended into another file, and orphaned whenever the uid changes.
+        Zero means "never stored", since no dimension is meaningfully zero.
+        """
+        if not hasattr(self, "value_store") or not self.is_property_set("value_store"):
+            return None
+        stored = float(self.value_store)
+        return stored if stored else None
+
+    def _set_value_force(self, value: float):
+        # Write both: the scene property is the driver endpoint (it can be
+        # animated, see on_frame_change), value_store is the durable copy.
+        if hasattr(self, "value_store"):
+            self.value_store = value
+        scene = self._get_scene()
+        key = self.value_key()
+        if scene is not None and key:
+            scene[key] = value
+
+    def _get_value(self):
+        if self.is_reference:
+            val = self.init_props()["value"]
+            return self.to_displayed_value(val)
+        scene = self._get_scene()
+        key = self.value_key()
+        if scene is not None and key and key in scene:
+            return self.to_displayed_value(float(scene[key]))
+        stored = self.stored_value()
+        if stored is not None:
+            return self.to_displayed_value(stored)
+        val = self.init_props().get("value", 0.0)
+        return self.to_displayed_value(val)
+
+    def assign_settings(self, **settings):
+        for key, value in settings.items():
+            if value is None:
+                continue
+
+            # "value" has a custom RNA getter that may call assign_init_props,
+            # so never read it back — just write unconditionally.
+            if key == "value":
+                setprop(self, key, value)
+                continue
+
+            # For all other keys (e.g. "setting", "flip", "align") skip the
+            # write when the value is unchanged so we don't fire update
+            # callbacks that would re-enter assign_init_props and recurse.
+            try:
+                current = getattr(self, key)
+            except Exception:
+                current = object()
+
+            if current == value:
+                continue
+
+            setprop(self, key, value)
+
+    def assign_init_props(self, context: Context = None, **kwargs):
+        self.assign_settings(**self.init_props(**kwargs))
+
+    def on_reference_checked(self, context: Context = None):
+        update_system_cb(self, context)
+        self.assign_init_props()
+        # Refresh the gizmos as we are changing the colors.
+        refresh(context)
+
+    is_reference: BoolProperty(
+        name="Only measure",
+        default=False,
+        update=on_reference_checked,
+    )
+
+    def init_props(self, **kwargs):
+        raise NotImplementedError()
+
+    def to_displayed_value(self, value):
+        """
+        Overwrite this function to convert the property value into
+        something to display on the user interface.
+        NOTE: If the value is writeable, do not forget to change
+              ``from_displayed_value()`` to apply the reverse operation.
+        """
+        return value
+
+    def from_displayed_value(self, displayed_value):
+        """
+        Convert the displayed value of the property into
+        a variable to store.
+        NOTE: See ``to_displayed_value()``
+        """
+        return displayed_value
+
+    def py_data(self, solvesys, **kwargs):
+        if self.is_reference:
+            return []
+        return self.create_slvs_data(solvesys, **kwargs)
+
+    def draw_value(self, layout: UILayout) -> bool:
+        """Draw the dimension's number. True when there was one to draw.
+
+        Split out of :func:`draw_props` so a caller can put it first: the value
+        is what a dimension is usually opened for, and a popup activates
+        whichever field is drawn first (see the edit dialog).
+        """
+        if not hasattr(self, "value"):
+            return False
+
+        import bpy
+
+        scene = bpy.context.scene
+        uid = getattr(self, "constraint_uid", "")
+        if not scene or not uid:
+            return False
+        key = scene.sketcher.get_constraint_value_endpoint(self)
+        if not key:
+            return False
+
+        col = layout.column()
+        col.enabled = not self.is_reference
+        # The column is only here to grey the field out on a reference
+        # dimension; carry the caller's activate_init through it, or asking for
+        # focus on the dialog would land on whatever it draws next instead.
+        col.activate_init = layout.activate_init
+        col.prop(scene, f'["{key}"]', text="Value")
+        return True
+
+    def draw_props(self, layout: UILayout, include_value: bool = True):
+        sub = GenericConstraint.draw_props(self, layout)
+        sub.prop(self, "is_reference")
+        if include_value:
+            self.draw_value(sub)
+        if hasattr(self, "setting"):
+            row = sub.row()
+            row.prop(self, "setting")
+        return sub

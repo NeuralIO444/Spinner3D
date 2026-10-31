@@ -1,0 +1,1549 @@
+"""Curve data access, curve_id system, and attribute helpers."""
+
+import logging
+import secrets
+from contextlib import contextmanager
+
+import bpy
+import numpy as np
+from mathutils import Vector
+
+from ..model.constants import SketchCurveType
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Attribute helpers
+# ---------------------------------------------------------------------------
+
+
+def ensure_attribute(attributes, name, type, domain):
+    """Ensure an attribute exists or create it if missing."""
+    attr = attributes.get(name)
+    if not attr:
+        attributes.new(name, type, domain)
+        attr = attributes.get(name)
+        if type == "STRING" and attr:
+            for i in range(len(attr.data)):
+                attr.data[i].value = b""
+    return attr
+
+
+# ---------------------------------------------------------------------------
+# Curve identity: 128-bit UUIDs stored as 2x INT32_2D sub-attributes.
+#
+# Blender wipes STRING attributes on remove_curves(); integer attributes survive
+# and re-index correctly. Each identity field is stored as two hidden ("."-
+# prefixed) INT32_2D attributes — the low and high 64-bit halves, each a pair of
+# int32 — and exposed as a 32-char lowercase hex string, so all higher-level code
+# keeps using the same string ids it always has.
+# ---------------------------------------------------------------------------
+
+UUID_FIELDS = ("curve_id", "start_point_id", "end_point_id", "center_point_id")
+
+# Blender's built-in curve_type values, and the set_types() names for them.
+CURVE_TYPE_BEZIER = 2
+CURVE_TYPE_NAMES = {0: "CATMULL_ROM", 1: "POLY", 2: "BEZIER", 3: "NURBS"}
+
+SOURCE_CURVE_ID_ATTR = ".cad_sketcher_source_curve_id"
+SOURCE_ENDPOINT_ID_ATTR = ".cad_sketcher_source_endpoint_id"
+
+
+def _uuid_subnames(field):
+    # 128-bit id = low and high 64-bit halves, each an INT32_2D (2x int32).
+    return (f".{field}_lo", f".{field}_hi")
+
+
+def _i32(u):  # unsigned 32-bit -> signed (Blender int32 is signed)
+    return u - 0x100000000 if u >= 0x80000000 else u
+
+
+def _u32(v):  # signed int32 -> unsigned
+    return v + 0x100000000 if v < 0 else v
+
+
+def _stable_source_id(words):
+    """Fold UUID words into a stable signed 32-bit id; zero means unset."""
+    if not any(words):
+        return 0
+    value = 0x811C9DC5
+    for word in words:
+        value = ((value ^ _u32(word)) * 0x01000193) & 0xFFFFFFFF
+    if value == 0:
+        value = 1
+    return _i32(value)
+
+
+def _hex_to_pairs(hexstr):
+    """Hex id -> (lo_pair, hi_pair), each a signed-int32 2-tuple for INT32_2D."""
+    u = int(hexstr, 16) if hexstr else 0
+    w = [_i32((u >> (32 * k)) & 0xFFFFFFFF) for k in range(4)]
+    return (w[0], w[1]), (w[2], w[3])
+
+
+def _pairs_to_hex(lo, hi):
+    """(lo_pair, hi_pair) -> 32-char hex id ('' when all-zero / unset)."""
+    words = (lo[0], lo[1], hi[0], hi[1])
+    if not any(words):
+        return ""
+    u = 0
+    for k, v in enumerate(words):
+        u |= _u32(v) << (32 * k)
+    return f"{u:032x}"
+
+
+def has_uuid_field(curve_data, field):
+    """Presence proxy for an identity field (its low sub-attribute)."""
+    return curve_data.attributes.get(f".{field}_lo")
+
+
+def get_uuid(curve_data, field, index):
+    """Read an identity field as a 32-char hex string ('' when unset)."""
+    lo = curve_data.attributes.get(f".{field}_lo")
+    hi = curve_data.attributes.get(f".{field}_hi")
+    lo_v = tuple(lo.data[index].value) if lo else (0, 0)
+    hi_v = tuple(hi.data[index].value) if hi else (0, 0)
+    return _pairs_to_hex(lo_v, hi_v)
+
+
+def _data_key(curve_data):
+    """The key a Curves datablock's caches are kept under.
+
+    The Python id() of its wrapper is an address: once the datablock is freed a
+    new one can be given the same wrapper address and would read the dead one's
+    entries as its own. An original datablock's session_uid is never handed out
+    twice in a session, so pairing the two keeps them apart.
+
+    Evaluated copies all report session_uid 0, so they would be told apart by
+    address alone, the very hazard above. Evaluated curve data must never be
+    passed to these caches; callers go through _get_original_data first.
+    """
+    return (id(curve_data), getattr(curve_data, "session_uid", 0))
+
+
+# (_data_key(curve_data), field) -> list of hex ids. Identity fields are
+# immutable after creation, so this is invalidated only by set_uuid (a value
+# write) and by add/remove via invalidate_curve_id_cache. Serves the hot read
+# paths (solver, segment rebuild, draw/pick) without re-deriving every hex id
+# from its int attributes on each call -- the dominant cost in solve and draw
+# (issue #342).
+_uuid_list_cache = {}
+# Parallel cache of the same ids in raw-int-tuple form (read_uuid_raw_list),
+# invalidated in lockstep with _uuid_list_cache.
+_uuid_raw_cache = {}
+
+# A cached list shorter than the curve count by at most this many is extended by
+# reading only the appended curves; a bigger gap is cheaper as one bulk read.
+_TAIL_READ_LIMIT = 64
+
+
+def set_uuid(curve_data, field, index, value):
+    """Write a hex-string identity field into its 2 INT32_2D sub-attributes."""
+    lo_pair, hi_pair = _hex_to_pairs(value)
+    lo = curve_data.attributes.get(f".{field}_lo")
+    hi = curve_data.attributes.get(f".{field}_hi")
+    if lo:
+        lo.data[index].value = lo_pair
+    if hi:
+        hi.data[index].value = hi_pair
+    _update_cached_uuid(curve_data, field, index, lo_pair, hi_pair)
+
+
+def _update_cached_uuid(curve_data, field, index, lo_pair, hi_pair):
+    """Keep the id caches in step with one written id, instead of dropping them.
+
+    Dropping them made the next lookup re-derive every curve's hex id; a draw
+    operator writes ids on every mouse move, so that re-derivation dominated.
+    An index past the cached tail needs nothing: the tail is read on demand.
+    """
+    key = (_data_key(curve_data), field)
+    hex_id = _pairs_to_hex(lo_pair, hi_pair)
+    old = None
+    cached = _uuid_list_cache.get(key)
+    if cached is not None and index < len(cached):
+        old = cached[index]
+        cached[index] = hex_id
+    raw = _uuid_raw_cache.get(key)
+    if raw is not None and index < len(raw):
+        raw[index] = (lo_pair[0], lo_pair[1], hi_pair[0], hi_pair[1])
+    if field != "curve_id":
+        return
+    index_map = _curve_id_cache.get(_data_key(curve_data))
+    if index_map is None or index >= _curve_id_built_len.get(_data_key(curve_data), 0):
+        return
+    if old is not None and index_map.get(old) == index:
+        del index_map[old]
+    index_map[hex_id] = index
+
+
+def _drop_field_caches(curve_data, field):
+    """Forget one id field's caches (a bulk write we can't follow in place)."""
+    key = (_data_key(curve_data), field)
+    _uuid_list_cache.pop(key, None)
+    _uuid_raw_cache.pop(key, None)
+    if field == "curve_id":
+        _curve_id_cache.pop(_data_key(curve_data), None)
+        _curve_id_built_len.pop(_data_key(curve_data), None)
+
+
+def new_uuid():
+    """Mint a fresh 128-bit identity as a 32-char hex string."""
+    return secrets.token_hex(16)
+
+
+def read_uuid_list(curve_data, field):
+    """All curves' ids for a field as hex strings, read in bulk (cached).
+
+    Uses foreach_get on the 2 INT32_2D sub-attributes — far cheaper than calling
+    get_uuid() per curve in hot loops. Memoized per (curve_data, field): identity
+    fields don't change except through set_uuid / add / remove, all of which
+    invalidate the entry, so repeated reads within a solve or across frames are
+    free. The length guard rebuilds if the curve count changed without an
+    explicit invalidation.
+    """
+    n = len(curve_data.curves)
+    key = (_data_key(curve_data), field)
+    cached = _uuid_list_cache.get(key)
+    if cached is not None and len(cached) == n:
+        return cached
+
+    lo = curve_data.attributes.get(f".{field}_lo")
+    hi = curve_data.attributes.get(f".{field}_hi")
+    if n == 0 or not lo or not hi:
+        return [""] * n
+    if cached is not None and 0 < n - len(cached) <= _TAIL_READ_LIMIT:
+        # Curves were appended since the list was built (creation only ever
+        # appends): read just the new ones rather than re-deriving every id.
+        for i in range(len(cached), n):
+            cached.append(
+                _pairs_to_hex(tuple(lo.data[i].value), tuple(hi.data[i].value))
+            )
+        return cached
+    lob = np.zeros(n * 2, dtype=np.int32)
+    hib = np.zeros(n * 2, dtype=np.int32)
+    lo.data.foreach_get("value", lob)
+    hi.data.foreach_get("value", hib)
+    result = [
+        _pairs_to_hex(
+            (int(lob[2 * i]), int(lob[2 * i + 1])),
+            (int(hib[2 * i]), int(hib[2 * i + 1])),
+        )
+        for i in range(n)
+    ]
+    _uuid_list_cache[key] = result
+    return result
+
+
+def read_uuid_raw_list(curve_data, field):
+    """All curves' ids for a field as raw ``(lo0, lo1, hi0, hi1)`` int tuples.
+
+    Like ``read_uuid_list`` but without the hex formatting: callers that only
+    compare ids for equality (e.g. grouping segment endpoints that share a
+    junction) don't need the string form, and building 4-int tuples is far
+    cheaper than ``_pairs_to_hex`` per curve. An all-zero tuple is the unset id
+    (falsy via ``any``).
+    """
+    n = len(curve_data.curves)
+    key = (_data_key(curve_data), field)
+    cached = _uuid_raw_cache.get(key)
+    if cached is not None and len(cached) == n:
+        return cached
+
+    lo = curve_data.attributes.get(f".{field}_lo")
+    hi = curve_data.attributes.get(f".{field}_hi")
+    if n == 0 or not lo or not hi:
+        return [(0, 0, 0, 0)] * n
+    if cached is not None and 0 < n - len(cached) <= _TAIL_READ_LIMIT:
+        for i in range(len(cached), n):
+            cached.append((*lo.data[i].value, *hi.data[i].value))
+        return cached
+    lob = np.zeros(n * 2, dtype=np.int32)
+    hib = np.zeros(n * 2, dtype=np.int32)
+    lo.data.foreach_get("value", lob)
+    hi.data.foreach_get("value", hib)
+    result = [
+        (int(lob[2 * i]), int(lob[2 * i + 1]), int(hib[2 * i]), int(hib[2 * i + 1]))
+        for i in range(n)
+    ]
+    _uuid_raw_cache[key] = result
+    return result
+
+
+TYPE_LABELS = {}
+
+
+def _type_labels():
+    from ..model.constants import SketchCurveType
+
+    if not TYPE_LABELS:
+        TYPE_LABELS.update(
+            {
+                SketchCurveType.POINT: "Point",
+                SketchCurveType.LINE: "Line",
+                SketchCurveType.ARC: "Arc",
+                SketchCurveType.CIRCLE: "Circle",
+            }
+        )
+    return TYPE_LABELS
+
+
+def type_label(ctype) -> str:
+    """The word a curve of this type goes by, e.g. "Line"."""
+    return _type_labels().get(ctype, "Curve")
+
+
+def next_name_ordinal(curve_data, ctype) -> int:
+    """The next free ordinal for this type, so names stay unique.
+
+    Counted from the highest one in use rather than from how many there are:
+    deleting "Line 2" must not make the next line a second "Line 3".
+    """
+    import numpy as np
+
+    n = len(curve_data.curves)
+    type_attr = curve_data.attributes.get("sketch_type")
+    ordinal_attr = curve_data.attributes.get("name_ordinal")
+    if not n or type_attr is None or ordinal_attr is None:
+        return 1
+    types = np.zeros(n, dtype=np.int32)
+    type_attr.data.foreach_get("value", types)
+    ordinals = np.zeros(n, dtype=np.int32)
+    ordinal_attr.data.foreach_get("value", ordinals)
+    mine = ordinals[types == int(ctype)]
+    return int(mine.max()) + 1 if mine.size else 1
+
+
+def default_curve_name(curve_data, ctype) -> str:
+    """A per-type default name like 'Line 3' for the next curve of that type."""
+    return f"{type_label(ctype)} {next_name_ordinal(curve_data, ctype)}"
+
+
+def set_attribute(attributes, name: str, value, index: int = None):
+    """Set an attribute value either for given index or for all."""
+    if name in UUID_FIELDS:
+        # Identity fields are hex ids stored as 2x INT32_2D (low/high halves).
+        lo_pair, hi_pair = _hex_to_pairs(value)
+        for sub, pair in ((f".{name}_lo", lo_pair), (f".{name}_hi", hi_pair)):
+            a = attributes.get(sub)
+            if not a:
+                continue
+            if index is None:
+                for i in range(len(a.data)):
+                    a.data[i].value = pair
+            else:
+                a.data[index].value = pair
+        curve_data = attributes.id_data
+        if index is None:
+            _drop_field_caches(curve_data, name)
+        else:
+            _update_cached_uuid(curve_data, name, index, lo_pair, hi_pair)
+        return
+    attribute = attributes.get(name)
+    if index is None:
+        attribute.data.foreach_set("value", (value,) * len(attribute.data))
+    else:
+        attribute.data[index].value = value
+
+
+def get_str_attr(attr, index):
+    """Read a STRING attribute value, decoding bytes to str."""
+    try:
+        v = attr.data[index].value
+        if isinstance(v, bytes):
+            try:
+                s = v.decode("ascii")
+            except (UnicodeDecodeError, ValueError):
+                return ""
+            return s.rstrip("\x00")
+        return v
+    except (ReferenceError, IndexError):
+        return ""
+
+
+def ensure_standard_attributes(curve_data):
+    """Ensure all standard curve attributes are present."""
+    attributes = curve_data.attributes
+    ensure_attribute(attributes, "cyclic", "BOOLEAN", "CURVE")
+    ensure_attribute(attributes, "sketch_type", "INT8", "CURVE")
+    ensure_attribute(attributes, "handle_type_left", "INT8", "POINT")
+    ensure_attribute(attributes, "handle_type_right", "INT8", "POINT")
+    ensure_attribute(attributes, "handle_left", "FLOAT_VECTOR", "POINT")
+    ensure_attribute(attributes, "handle_right", "FLOAT_VECTOR", "POINT")
+    ensure_attribute(attributes, "resolution", "INT", "CURVE")
+    ensure_attribute(attributes, "construction", "BOOLEAN", "CURVE")
+    ensure_attribute(attributes, "fixed", "BOOLEAN", "CURVE")
+    ensure_attribute(attributes, "visible", "BOOLEAN", "CURVE")
+    # Marks the sketch's protected origin point (undeletable, auto-restored).
+    ensure_attribute(attributes, "is_origin", "BOOLEAN", "CURVE")
+    # Per-point weld identity for the Blender 5.2 "Merge Points" fill path:
+    # segment endpoints sharing a junction get the same id (see compute_merge_ids).
+    ensure_attribute(attributes, "merge_id", "INT", "POINT")
+    # UUID-derived seeds consumed by both conversion node-group variants.
+    ensure_attribute(attributes, SOURCE_CURVE_ID_ATTR, "INT", "CURVE")
+    ensure_attribute(attributes, SOURCE_ENDPOINT_ID_ATTR, "INT", "POINT")
+    # Identity fields: 2x INT32_2D each (128-bit), hidden. Integer attributes
+    # survive remove_curves() (STRING attributes don't).
+    for field in UUID_FIELDS:
+        for sub in _uuid_subnames(field):
+            ensure_attribute(attributes, sub, "INT32_2D", "CURVE")
+    # Ordinal behind a displayed name like "Line 3" (see model/curve_names.py).
+    ensure_attribute(attributes, "name_ordinal", "INT", "CURVE")
+
+
+# ---------------------------------------------------------------------------
+# Curve ID system
+# ---------------------------------------------------------------------------
+
+_curve_id_cache = {}
+# _data_key(curve_data) -> how many curves the index map covers (it grows by
+# appending).
+_curve_id_built_len = {}
+
+
+def read_curve_id_list(curve_data):
+    """Cached ordered list of curve_id hex strings (see read_uuid_list)."""
+    return read_uuid_list(curve_data, "curve_id")
+
+
+# Curve ids an operator re-run hands back to the curves it recreates, so its
+# stored identities (picked points, its own output) stay valid. Keyed per sketch
+# object; ``_alloc_records`` captures the ids handed out while recording.
+_reuse_queues = {}
+_alloc_records = {}
+
+
+def _reuse_key(sketch):
+    obj = getattr(sketch, "target_object", None)
+    return obj.as_pointer() if obj is not None else None
+
+
+@contextmanager
+def reusing_curve_ids(sketch, ids, record=None):
+    """Give curves created inside the block these ids, in order.
+
+    An id already in use is skipped, so a stale id can never duplicate a live
+    curve. When ``record`` is a list, every id handed out is appended to it.
+    """
+    key = _reuse_key(sketch)
+    if key is None:
+        yield
+        return
+    _reuse_queues[key] = [cid for cid in ids if cid]
+    if record is not None:
+        _alloc_records[key] = record
+    try:
+        yield
+    finally:
+        _reuse_queues.pop(key, None)
+        _alloc_records.pop(key, None)
+
+
+def _allocate_curve_id(sketch):
+    """Allocate a curve_id: a queued reuse id if one is free, else a new one."""
+    key = _reuse_key(sketch)
+    cid = ""
+    queue = _reuse_queues.get(key)
+    while queue and not cid:
+        candidate = queue.pop(0)
+        if get_curve_index(sketch, candidate) is None:
+            cid = candidate
+    cid = cid or secrets.token_hex(16)
+    record = _alloc_records.get(key)
+    if record is not None:
+        record.append(cid)
+    return cid
+
+
+def get_curve_index(sketch, curve_id):
+    """Look up curve index by curve_id. Uses runtime cache, falls back to scan."""
+    cd = _get_original_data(sketch)
+    if not cd:
+        return None
+    sk_key = _data_key(cd)
+    cache = _curve_id_cache.get(sk_key)
+    if cache is not None:
+        idx = cache.get(curve_id)
+        if idx is not None:
+            return idx
+        # A miss is usually a curve appended since the map was built: index just
+        # the new tail rather than rebuilding the whole map.
+        built = _curve_id_built_len.get(sk_key, 0)
+        ids = read_uuid_list(cd, "curve_id")
+        if built < len(ids):
+            for i in range(built, len(ids)):
+                cache[ids[i]] = i
+            _curve_id_built_len[sk_key] = len(ids)
+            idx = cache.get(curve_id)
+            if idx is not None:
+                return idx
+    return _rebuild_curve_id_cache(sketch, curve_id)
+
+
+def _rebuild_curve_id_cache(sketch, lookup_id=None):
+    """Rebuild the curve_id -> curve_index cache for a sketch."""
+    curve_data = _get_original_data(sketch)
+    if not curve_data:
+        return None
+    sk_key = _data_key(curve_data)
+    ids = read_uuid_list(curve_data, "curve_id")
+    cache = {cid: i for i, cid in enumerate(ids)}
+    _curve_id_cache[sk_key] = cache
+    _curve_id_built_len[sk_key] = len(ids)
+    return cache.get(lookup_id) if lookup_id is not None else None
+
+
+def invalidate_curve_id_cache(sketch=None):
+    """Invalidate the curve_id caches. Call after add/remove curves."""
+    if sketch and sketch.target_object:
+        invalidate_curve_data_caches(sketch.target_object.data)
+    else:
+        _curve_id_cache.clear()
+        _curve_id_built_len.clear()
+        _uuid_list_cache.clear()
+        _uuid_raw_cache.clear()
+        _merge_signatures.clear()
+
+
+def invalidate_curve_data_caches(curve_data):
+    """Drop every id cache of one Curves datablock, and its weld-id gate."""
+    sk_key = _data_key(curve_data)
+    # Whatever replaced the geometry also replaced the weld ids, and the
+    # connectivity signature cannot see that: a drawing preview restores its
+    # snapshot every mouse move, which puts back the weld ids the sketch had
+    # before the shape existed (see compute_merge_ids).
+    _merge_signatures.pop(sk_key, None)
+    _curve_id_cache.pop(sk_key, None)
+    _curve_id_built_len.pop(sk_key, None)
+    for field in UUID_FIELDS:
+        _uuid_list_cache.pop((sk_key, field), None)
+        _uuid_raw_cache.pop((sk_key, field), None)
+
+
+def note_curve_appended(sketch):
+    """Tell the id caches that one curve was just appended and fully written.
+
+    Every cached entry for the curves that already existed stays valid, since
+    creation only appends. Only a tail entry that may have been read before all
+    of the new curve's ids were written is dropped; it is re-read on demand.
+    """
+    obj = sketch.target_object
+    if obj is None or obj.data is None:
+        return
+    curve_data = obj.data
+    sk_key = _data_key(curve_data)
+    keep = len(curve_data.curves) - 1
+    for field in UUID_FIELDS:
+        for cache in (_uuid_list_cache, _uuid_raw_cache):
+            cached = cache.get((sk_key, field))
+            if cached is not None and len(cached) > keep:
+                del cached[keep:]
+    index_map = _curve_id_cache.get(sk_key)
+    if index_map is not None and _curve_id_built_len.get(sk_key, 0) > keep:
+        for cid in [cid for cid, i in index_map.items() if i >= keep]:
+            del index_map[cid]
+        _curve_id_built_len[sk_key] = keep
+
+
+def capture_id_caches(curve_data):
+    """Snapshot a datablock's id caches, to reinstate after restoring its data."""
+    return {
+        "curve_id_map": dict(
+            (cid, i) for i, cid in enumerate(read_uuid_list(curve_data, "curve_id"))
+        ),
+        "fields": {
+            field: (
+                list(read_uuid_list(curve_data, field)),
+                list(read_uuid_raw_list(curve_data, field)),
+            )
+            for field in UUID_FIELDS
+        },
+        "n_curves": len(curve_data.curves),
+    }
+
+
+def install_id_caches(curve_data, captured):
+    """Reinstate caches captured when ``curve_data`` was in its current state.
+
+    Only valid right after restoring the exact data they were captured from
+    (the per-mouse-move snapshot restore of a drawing operator), which is what
+    lets that restore skip re-deriving every curve's hex id. Copies are
+    installed because later writes update cached lists in place.
+    """
+    invalidate_curve_data_caches(curve_data)
+    if not captured or len(curve_data.curves) != captured["n_curves"]:
+        return
+    sk_key = _data_key(curve_data)
+    for field, (hex_ids, raw_ids) in captured["fields"].items():
+        if len(hex_ids) == captured["n_curves"]:
+            _uuid_list_cache[(sk_key, field)] = list(hex_ids)
+        if len(raw_ids) == captured["n_curves"]:
+            _uuid_raw_cache[(sk_key, field)] = list(raw_ids)
+    _curve_id_cache[sk_key] = dict(captured["curve_id_map"])
+    _curve_id_built_len[sk_key] = captured["n_curves"]
+
+
+# ---------------------------------------------------------------------------
+# Curve data access
+# ---------------------------------------------------------------------------
+
+
+def _get_original_data(sketch):
+    """The original (non-evaluated) Curves data for a sketch.
+
+    A sketch's object comes from the scene, so it is already an original; there
+    is nothing to follow, and following ``.original`` from a depsgraph handler
+    is what crashes Blender on an id that is still being built.
+    """
+    obj = sketch.target_object
+    if not obj or not obj.data:
+        return None
+    return obj.data
+
+
+def get_curve_data(sketch, curve_id):
+    """Get curve slice and attributes for a curve_id.
+
+    Returns:
+        tuple: (curve_data, curve_index, curve_slice) or (None, None, None)
+    """
+    curve_data = _get_original_data(sketch)
+    if not curve_data:
+        return None, None, None
+    idx = get_curve_index(sketch, curve_id)
+    if idx is None or idx >= len(curve_data.curves):
+        return None, None, None
+    return curve_data, idx, curve_data.curves[idx]
+
+
+def get_curve_type(sketch, curve_id):
+    """Get the SketchCurveType for a curve_id."""
+    curve_data, idx, _ = get_curve_data(sketch, curve_id)
+    if curve_data is None:
+        return None
+    type_attr = curve_data.attributes.get("sketch_type")
+    if not type_attr:
+        return None
+    return type_attr.data[idx].value
+
+
+def get_curve_position(sketch, curve_id):
+    """Get the local-space position of a point curve."""
+    curve_data, idx, curve_slice = get_curve_data(sketch, curve_id)
+    if curve_data is None:
+        return None
+    pt_idx = curve_slice.points[0].index
+    return Vector(curve_data.points[pt_idx].position)
+
+
+def get_curve_world_position(sketch, curve_id):
+    """Get the world-space position of a point curve."""
+    pos = get_curve_position(sketch, curve_id)
+    if pos is None:
+        return None
+    return sketch.target_object.matrix_world @ pos
+
+
+def get_curve_placement(sketch, curve_id):
+    """Get the world-space placement position for a curve (for gizmo positioning)."""
+    curve_data, idx, curve_slice = get_curve_data(sketch, curve_id)
+    if curve_data is None:
+        return None
+
+    type_attr = curve_data.attributes.get("sketch_type")
+    ctype = type_attr.data[idx].value if type_attr else -1
+    mat = sketch.target_object.matrix_world
+
+    if ctype == SketchCurveType.LINE and curve_slice.points_length >= 2:
+        first = curve_slice.points[0].index
+        p1 = Vector(curve_data.points[first].position)
+        p2 = Vector(curve_data.points[first + 1].position)
+        return mat @ ((p1 + p2) / 2)
+    elif curve_slice.points_length >= 1:
+        pos = Vector(curve_data.points[curve_slice.points[0].index].position)
+        return mat @ pos
+    return None
+
+
+def get_curve_midpoints(curve_slice, is_cyclic):
+    """Get interior bezier points from a curve slice."""
+    if len(curve_slice.points) <= 2:
+        return []
+    if is_cyclic:
+        return [curve_slice.points[i] for i in range(1, len(curve_slice.points))]
+    return [curve_slice.points[i] for i in range(1, len(curve_slice.points) - 1)]
+
+
+# ---------------------------------------------------------------------------
+# Curve object management
+# ---------------------------------------------------------------------------
+
+CONVERT_MODIFIER_NAME = "CAD Sketcher Convert"
+
+
+def _ensure_convert_modifier(ob):
+    """Get or create the GN convert modifier on a curve object."""
+    assert ob is not None, "_ensure_convert_modifier: object is None"
+
+    modifier = ob.modifiers.get(CONVERT_MODIFIER_NAME)
+    created = not modifier
+    if created:
+        modifier = ob.modifiers.new(CONVERT_MODIFIER_NAME, "NODES")
+        assert modifier is not None, "Failed to create GN modifier"
+
+    if modifier and not modifier.node_group:
+        ng = _get_convert_node_group()
+        if ng:
+            modifier.node_group = ng
+        else:
+            logger.warning("Could not obtain 'CAD Sketcher Convert' node group")
+
+    if created and modifier.node_group:
+        _apply_default_angular_resolution(modifier)
+
+    return modifier
+
+
+def _apply_default_angular_resolution(modifier) -> None:
+    """Start a new sketch at the angular resolution set in the preferences."""
+    from ..operators.modifiers import set_modifier_input
+    from .convert_nodes import ANGULAR_RESOLUTION_INPUT, input_identifier
+    from .preferences import get_prefs
+
+    identifier = input_identifier(modifier.node_group, ANGULAR_RESOLUTION_INPUT)
+    if identifier is None:
+        return
+    set_modifier_input(modifier, identifier, get_prefs().curve_angular_resolution)
+
+
+def _get_convert_node_group():
+    """The convert node group, built programmatically for every Blender version.
+
+    The build is identical apart from the weld: Blender 5.2+ welds sketch
+    endpoints by identity (Merge Points), older Blender merges coincident
+    endpoints by distance (all it can express). Building both keeps the two
+    paths in lockstep instead of shipping a separate, drift-prone asset."""
+    from .convert_nodes import build_convert_node_group
+
+    return build_convert_node_group()
+
+
+def sketch_curve_data(sketch):
+    """A sketch's curve data, or None when it has no curve object.
+
+    A plain read: this is reached from solving and drawing, where creating
+    objects is not allowed (Blender falls over if a new object with a bound node
+    group appears mid-solve). Sketches are built by the Add Sketch tool, and an
+    older file's entity sketches by the file update, so by the time geometry is
+    added the object is there.
+    """
+    assert sketch is not None, "sketch_curve_data: sketch is None"
+
+    obj = sketch.target_object
+    if obj is None:
+        logger.warning("sketch_curve_data: '%s' has no curve object", sketch.name)
+        return None
+    return obj.data
+
+
+def create_sketch_curve_object(context, sketch):
+    """Build the curve object an entity sketch is missing.
+
+    For the paths that legitimately make a sketch outside the Add Sketch tool:
+    harnesses that drive the model directly, and tests. Never from solving or
+    drawing -- see :func:`sketch_curve_data`.
+
+    Builds the pre-split shape, with the stack on the sketch itself: giving it a
+    body here is what a file update does, with the whole scene in hand.
+    """
+    assert sketch is not None, "create_sketch_curve_object: sketch is None"
+
+    wp_obj = sketch.workplane_object
+    if not wp_obj and hasattr(sketch, "wp") and not sketch.wp:
+        logger.warning("create_sketch_curve_object: no workplane empty or entity")
+        return None
+
+    if sketch.target_object is None:
+        from ..model.sketch_ref import stamp_sketch_props
+        from .collections import link_to_scene_root
+
+        curve = bpy.data.hair_curves.new(sketch.name)
+        obj = bpy.data.objects.new(sketch.name, curve)
+        sketch.target_object = obj
+
+        if wp_obj:
+            obj.matrix_world = wp_obj.matrix_world
+        elif hasattr(sketch, "wp") and sketch.wp:
+            obj.matrix_world = sketch.wp.matrix_basis
+
+        link_to_scene_root(obj, context.scene)
+        stamp_sketch_props(obj)
+        _ensure_convert_modifier(obj)
+
+    return sketch.target_object.data
+
+
+def remove_native_curve_by_id(sketch, curve_id):
+    """Remove a curve by its stable curve_id."""
+    if not sketch or not sketch.target_object or not sketch.target_object.data:
+        return
+    curve_data = sketch.target_object.data
+    n_curves = len(curve_data.curves)
+    if n_curves == 0:
+        return
+
+    if not has_uuid_field(curve_data, "curve_id"):
+        return
+
+    to_remove = []
+    for curve_idx in range(n_curves):
+        if get_uuid(curve_data, "curve_id", curve_idx) == curve_id:
+            to_remove.append(curve_idx)
+
+    if to_remove:
+        # Identity, flags and the name ordinal are integers: they survive
+        # remove_curves() and re-index themselves, so nothing has to be carried
+        # across (see model/curve_names.py).
+        curve_data.remove_curves(indices=to_remove)
+        ensure_standard_attributes(curve_data)
+
+        invalidate_curve_id_cache(sketch)
+        curve_data.update_tag()
+
+
+# batch key -> the open batch_update, so writes can report into it.
+_batch_sketches = {}
+
+
+def _batch_key(sketch):
+    """Stable identity for batching, shared across Sketch wrapper instances.
+
+    Different code paths wrap the same sketch object in distinct Sketch
+    instances, so id(sketch) is NOT stable — keying on it makes is_batching()
+    miss and rebuild every segment per point write. The object's C pointer is
+    the same across all wrappers.
+    """
+    obj = sketch.target_object
+    return obj.as_pointer() if obj else id(sketch)
+
+
+class batch_update:
+    """Context manager that defers rebuild_segments until exit.
+
+    Usage:
+        with batch_update(sketch):
+            for point in points:
+                point.co = new_pos  # no rebuild per write
+        # rebuild_segments called once here
+
+    Pass ``point_ids`` to rebuild only the segments referencing those points.
+    """
+
+    def __init__(self, sketch, point_ids=None, track_writes=False):
+        self.sketch = sketch
+        self.point_ids = point_ids
+        # With track_writes, only the segments of points written through
+        # note_point_write are rebuilt on exit (plus one weld-id pass), instead of
+        # every segment. Only for callers whose other writes keep segments
+        # consistent themselves (curve creation does; a snapshot restore does).
+        self.track_writes = track_writes
+        self.written_point_ids = set()
+
+    def __enter__(self):
+        _batch_sketches[_batch_key(self.sketch)] = self
+        return self
+
+    def __exit__(self, *args):
+        _batch_sketches.pop(_batch_key(self.sketch), None)
+        if not self.track_writes:
+            rebuild_segments(self.sketch, point_ids=self.point_ids)
+            return
+        if self.written_point_ids:
+            rebuild_segments(self.sketch, point_ids=self.written_point_ids)
+        # Curves created inside the batch deferred their weld ids to here.
+        compute_merge_ids(self.sketch)
+
+
+def note_point_write(sketch, curve_id):
+    """Record a point position deferred by the open batch on ``sketch``."""
+    batch = _batch_sketches.get(_batch_key(sketch))
+    if batch is not None:
+        batch.written_point_ids.add(curve_id)
+
+
+def is_batching(sketch):
+    return _batch_key(sketch) in _batch_sketches
+
+
+def is_fixed(sketch, curve_id):
+    """Check if a curve is directly marked as fixed."""
+    cd, idx, _ = get_curve_data(sketch, curve_id)
+    if cd is None:
+        return False
+    fix_attr = cd.attributes.get("fixed")
+    return bool(fix_attr and fix_attr.data[idx].value)
+
+
+# Angular dead-band (as a fraction of a quarter turn) applied when deciding an
+# arc's segment count, so an arc whose sweep sits right on a 90 degree boundary
+# doesn't add/drop a segment on every solve.
+_ARC_SEG_HYSTERESIS = 0.05
+
+
+def _target_arc_segments(angle, current):
+    """Segment count for an arc of the given sweep angle, with hysteresis.
+
+    Each cubic bezier segment approximates at most ~90 degrees of arc; beyond
+    that the approximation degrades. The count is recomputed as the arc's sweep
+    changes (e.g. an endpoint is dragged) so accuracy is maintained, but a dead
+    band around each 90 degree boundary keeps it from thrashing.
+    """
+    import math
+
+    from .constants import QUARTER_TURN
+
+    raw = angle / QUARTER_TURN
+    if raw > current + _ARC_SEG_HYSTERESIS:
+        return max(1, math.ceil(raw))
+    if current > 1 and raw < (current - 1) - _ARC_SEG_HYSTERESIS:
+        return max(1, math.ceil(raw))
+    return current
+
+
+def _resegment_arcs(sketch, cd, point_ids=None):
+    """Resize arcs whose control-point count no longer fits their sweep angle.
+
+    Arc bezier points carry no identity (center/start/end live in separate point
+    curves), so the count is free to change. ``resize_curves`` reindexes the
+    point domain, so this must run before any per-point data is read.
+
+    Returns True if any arc was resized.
+    """
+    import math
+
+    from ..model.constants import BezierHandleType, SketchCurveType
+    from .math import range_2pi
+
+    ob = sketch.target_object
+    # Never resize geometry the user is editing by hand.
+    if ob is None or getattr(ob, "mode", "OBJECT") == "EDIT":
+        return False
+
+    type_attr = cd.attributes.get("sketch_type")
+    if not type_attr:
+        return False
+
+    n = len(cd.curves)
+    types = np.empty(n, dtype=np.int32)
+    type_attr.data.foreach_get("value", types)
+    if not (types == SketchCurveType.ARC).any():
+        return False
+
+    cp_ids = read_uuid_list(cd, "center_point_id")
+    sp_ids = read_uuid_list(cd, "start_point_id")
+    ep_ids = read_uuid_list(cd, "end_point_id")
+
+    # Arcs to consider (all, or only those touching a changed point).
+    arc_indices = [
+        i
+        for i in range(n)
+        if types[i] == SketchCurveType.ARC
+        and (
+            point_ids is None
+            or sp_ids[i] in point_ids
+            or ep_ids[i] in point_ids
+            or cp_ids[i] in point_ids
+        )
+    ]
+    if not arc_indices:
+        return False
+
+    # id -> 2D position, built only for the point curves those arcs reference.
+    needed = set()
+    for i in arc_indices:
+        needed.update((cp_ids[i], sp_ids[i], ep_ids[i]))
+    curve_ids = read_uuid_list(cd, "curve_id")
+    pos_map = {}
+    for i in range(n):
+        if types[i] == SketchCurveType.POINT and curve_ids[i] in needed:
+            p = cd.points[cd.curves[i].points[0].index].position
+            pos_map[curve_ids[i]] = Vector((p[0], p[1]))
+
+    sizes = None
+    changed = []
+    for i in arc_indices:
+        ct = pos_map.get(cp_ids[i])
+        s = pos_map.get(sp_ids[i])
+        e = pos_map.get(ep_ids[i])
+        if ct is None or s is None or e is None:
+            continue
+
+        sv, ev = s - ct, e - ct
+        angle = range_2pi(math.atan2(ev[1], ev[0]) - math.atan2(sv[1], sv[0]))
+        current = cd.curves[i].points_length - 1
+        target = _target_arc_segments(angle, current)
+        if target != current:
+            if sizes is None:
+                sizes = [cv.points_length for cv in cd.curves]
+            sizes[i] = target + 1
+            changed.append(i)
+
+    if sizes is None:
+        return False
+
+    cd.resize_curves(sizes)
+
+    # New points come in zero-initialized; give them free bezier handles so
+    # _build_arc_bezier's handle vectors take effect. (Positions/handles for the
+    # whole arc are rewritten by the rebuild pass that follows.)
+    attrs = cd.attributes
+    hlt = attrs.get("handle_type_left")
+    hrt = attrs.get("handle_type_right")
+    for i in changed:
+        for pt in cd.curves[i].points:
+            if hlt:
+                hlt.data[pt.index].value = BezierHandleType.FREE
+            if hrt:
+                hrt.data[pt.index].value = BezierHandleType.FREE
+    return True
+
+
+# object name -> connectivity signature at the last merge-id computation. Weld
+# ids and source seeds are derived purely from connectivity (which point curves a
+# segment references, plus coincidence constraints), never from positions, so a
+# position-only change -- every solve, every drag frame -- cannot alter them.
+_merge_signatures = {}
+
+
+def reset_merge_cache():
+    """Drop the merge-id signature cache (e.g. on file load)."""
+    _merge_signatures.clear()
+
+
+def _connectivity_signature(cd):
+    """Fingerprint of everything ``compute_merge_ids`` actually reads.
+
+    Identity ids, curve types, per-curve point counts (which fix the point
+    indices a junction lands on) and the coincidence constraint pairs. Positions
+    are deliberately absent: that is the whole point of the gate.
+    """
+    n_curves = len(cd.curves)
+    n_points = len(cd.points)
+    parts = []
+    for field in ("curve_id", "start_point_id", "end_point_id"):
+        for half in ("lo", "hi"):
+            buf = np.zeros(n_curves * 2, dtype=np.int32)
+            attr = cd.attributes.get(f".{field}_{half}")
+            if attr:
+                attr.data.foreach_get("value", buf)
+            parts.append(buf.tobytes())
+
+    types = np.zeros(n_curves, dtype=np.int32)
+    type_attr = cd.attributes.get("sketch_type")
+    if type_attr:
+        type_attr.data.foreach_get("value", types)
+    parts.append(types.tobytes())
+
+    # Arc resegmentation changes point counts, which shifts every later point
+    # index, so the counts belong in the key even though no id changed.
+    counts = np.zeros(n_curves, dtype=np.int32)
+    cd.curves.foreach_get("points_length", counts)
+    parts.append(counts.tobytes())
+
+    constraints = getattr(cd, "sketch_constraints", None)
+    coincident = ()
+    if constraints is not None:
+        coincident = tuple(
+            sorted((c.curve_id_1, c.curve_id_2) for c in constraints.coincident)
+        )
+
+    return (n_curves, n_points, coincident, hash(b"".join(parts)))
+
+
+def _merge_outputs_present(cd):
+    """Whether the attributes the merge pass writes already exist.
+
+    The signature says the *inputs* are unchanged; it says nothing about a fresh
+    datablock that has never had the outputs written. Never skip in that case.
+    """
+    return (
+        cd.attributes.get("merge_id") is not None
+        and cd.attributes.get(SOURCE_CURVE_ID_ATTR) is not None
+        and cd.attributes.get(SOURCE_ENDPOINT_ID_ATTR) is not None
+    )
+
+
+def compute_merge_ids(sketch, force=False):
+    """Assign each curve point a weld id derived from segment connectivity.
+
+    A segment endpoint gets a dense id for the point curve it references
+    (``start_point_id`` / ``end_point_id``), so both endpoints meeting at a
+    junction share one id. The 5.2 convert node group welds mesh vertices by this
+    id -- gated to true endpoints via vertex valence -- closing loops by identity
+    instead of by proximity: tolerance-free and independent of sketch scale.
+
+    Endpoints tied only by a coincidence *constraint* belong to distinct point
+    entities at one location (e.g. a rectangle drawn as four separate lines), so
+    those point ids are unioned first: the corner then welds and the loop closes.
+    Without this the identity weld would leave such corners open and the shape
+    would not fill.
+
+    Interior, point and circle vertices keep id 0; they are never welded (their
+    valence is not 1), so their id is irrelevant. Returns True if anything ran.
+
+    Skipped when the sketch's connectivity is unchanged since the last run, since
+    positions cannot affect the result -- pass ``force=True`` to recompute anyway.
+    """
+    if not sketch or not sketch.target_object or not sketch.target_object.data:
+        return False
+    obj = sketch.target_object
+    cd = obj.data
+    n_points = len(cd.points)
+    type_attr = cd.attributes.get("sketch_type")
+    if n_points == 0 or not type_attr:
+        return False
+
+    signature = _connectivity_signature(cd)
+    if (
+        not force
+        and _merge_signatures.get(_data_key(cd)) == signature
+        and _merge_outputs_present(cd)
+    ):
+        return False
+
+    # Only equality of endpoint ids matters here (shared junction -> shared weld
+    # id), so read the raw id tuples and skip the per-curve hex formatting.
+    sp_ids = read_uuid_raw_list(cd, "start_point_id")
+    ep_ids = read_uuid_raw_list(cd, "end_point_id")
+    # A standalone point entity's own curve_id is the id that segments reference
+    # through start/end_point_id, so it joins the same junction and welds onto the
+    # shared corner instead of sitting as a duplicate vertex.
+    curve_ids = read_uuid_raw_list(cd, "curve_id")
+
+    # Union-find over point ids so coincidence-constrained endpoints share a
+    # junction. Keyed on the raw id tuple, matching junction()'s keys below.
+    _parent = {}
+
+    def _find(x):
+        _parent.setdefault(x, x)
+        root = x
+        while _parent[root] != root:
+            root = _parent[root]
+        while _parent[x] != root:
+            _parent[x], x = root, _parent[x]
+        return root
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            _parent[ra] = rb
+
+    constraints = getattr(cd, "sketch_constraints", None)
+    if constraints is not None:
+        # Coincidence constraints carry hex ids; map the point entities they can
+        # reference back to their raw tuple so unions share junction()'s key space.
+        curve_ids_hex = read_uuid_list(cd, "curve_id")
+        hex_to_raw = {
+            curve_ids_hex[i]: curve_ids[i]
+            for i in range(len(cd.curves))
+            if type_attr.data[i].value == SketchCurveType.POINT and curve_ids_hex[i]
+        }
+        for c in constraints.coincident:
+            a = hex_to_raw.get(c.curve_id_1)
+            b = hex_to_raw.get(c.curve_id_2)
+            if a is not None and b is not None:
+                _union(a, b)
+
+    ids = np.zeros(n_points, dtype=np.int32)
+    dense = {}
+
+    def junction(u):
+        # 1-based so 0 stays the "no weld" default for interior/circle vertices.
+        return dense.setdefault(_find(u), len(dense) + 1)
+
+    # First, junctions from the segments' referenced endpoints.
+    for i in range(len(cd.curves)):
+        t = type_attr.data[i].value
+        if t not in (SketchCurveType.LINE, SketchCurveType.ARC):
+            continue
+        cv = cd.curves[i]
+        npt = cv.points_length
+        if npt < 2:
+            continue
+        if any(sp_ids[i]):
+            ids[cv.points[0].index] = junction(sp_ids[i])
+        if any(ep_ids[i]):
+            ids[cv.points[npt - 1].index] = junction(ep_ids[i])
+
+    # Then weld each standalone point entity onto its coincident corner -- but
+    # only when a segment actually references it. A lone point or an arc/circle
+    # center that no segment endpoint uses stays 0 (never welded).
+    for i in range(len(cd.curves)):
+        if type_attr.data[i].value != SketchCurveType.POINT:
+            continue
+        cv = cd.curves[i]
+        if cv.points_length < 1:
+            continue
+        jid = dense.get(_find(curve_ids[i]))
+        if jid is not None:
+            ids[cv.points[0].index] = jid
+
+    attr = cd.attributes.get("merge_id")
+    if attr is None:
+        attr = cd.attributes.new("merge_id", "INT", "POINT")
+    attr.data.foreach_set("value", ids)
+    compute_generated_id_seeds(sketch)
+    _merge_signatures[_data_key(cd)] = signature
+    return True
+
+
+def compute_generated_id_seeds(sketch):
+    """Write stable source seeds used to identify generated mesh children."""
+    if not sketch or not sketch.target_object or not sketch.target_object.data:
+        return False
+    cd = sketch.target_object.data
+    n_curves = len(cd.curves)
+    if n_curves == 0:
+        return False
+
+    attrs = cd.attributes
+    curve_attr = ensure_attribute(attrs, SOURCE_CURVE_ID_ATTR, "INT", "CURVE")
+    endpoint_attr = ensure_attribute(attrs, SOURCE_ENDPOINT_ID_ATTR, "INT", "POINT")
+    type_attr = attrs.get("sketch_type")
+    if not curve_attr or not endpoint_attr or not type_attr:
+        return False
+
+    # Vectorized: this runs for the whole sketch whenever connectivity changes,
+    # which while drawing is once per mouse move, and the per-curve Python hash
+    # grew with every shape in the sketch. Same FNV fold as _stable_source_id.
+    curve_seeds = _stable_source_ids(_raw_id_words(cd, "curve_id", n_curves))
+
+    types = np.empty(n_curves, dtype=np.int32)
+    type_attr.data.foreach_get("value", types)
+    offsets = np.empty(n_curves + 1, dtype=np.int32)
+    cd.curve_offset_data.foreach_get("value", offsets)
+    counts = np.diff(offsets)
+    segment = np.isin(types, (SketchCurveType.LINE, SketchCurveType.ARC)) & (
+        counts >= 2
+    )
+
+    endpoint_seeds = np.zeros(len(cd.points), dtype=np.int32)
+    for field, point_index in (
+        ("start_point_id", offsets[:-1]),
+        ("end_point_id", offsets[1:] - 1),
+    ):
+        words = _raw_id_words(cd, field, n_curves)
+        write = segment & words.any(axis=1)
+        endpoint_seeds[point_index[write]] = _stable_source_ids(words[write])
+
+    curve_attr.data.foreach_set("value", curve_seeds)
+    endpoint_attr.data.foreach_set("value", endpoint_seeds)
+    return True
+
+
+def _raw_id_words(curve_data, field, n_curves):
+    """An id field as an (n, 4) int32 array of (lo0, lo1, hi0, hi1) words."""
+    words = np.zeros((n_curves, 4), dtype=np.int32)
+    lo = curve_data.attributes.get(f".{field}_lo")
+    hi = curve_data.attributes.get(f".{field}_hi")
+    if lo and hi:
+        pair = np.empty(n_curves * 2, dtype=np.int32)
+        lo.data.foreach_get("value", pair)
+        words[:, :2] = pair.reshape(-1, 2)
+        hi.data.foreach_get("value", pair)
+        words[:, 2:] = pair.reshape(-1, 2)
+    return words
+
+
+def _stable_source_ids(words):
+    """Vectorized ``_stable_source_id`` over an (n, 4) int32 word array."""
+    fnv_prime = np.uint64(0x01000193)
+    mask = np.uint64(0xFFFFFFFF)
+    value = np.full(len(words), 0x811C9DC5, dtype=np.uint64)
+    unsigned = words.astype(np.int64) & 0xFFFFFFFF
+    for k in range(4):
+        value = ((value ^ unsigned[:, k].astype(np.uint64)) * fnv_prime) & mask
+    value[value == 0] = 1
+    signed = value.astype(np.int64)
+    signed[signed >= 0x80000000] -= 0x100000000
+    signed[~words.any(axis=1)] = 0
+    return signed.astype(np.int32)
+
+
+def rebuild_segments(sketch, point_ids=None):
+    """Rebuild segment curve positions from their referenced point curves.
+
+    Lines: copy endpoint positions from point curves.
+    Arcs/circles: recompute bezier geometry from center/start/end point curves.
+
+    Call after modifying point positions to keep segment data consistent. When
+    ``point_ids`` is given, only segments referencing one of those point ids are
+    rebuilt (e.g. during a move, where only the dragged points changed) — this
+    avoids re-resolving every segment in the sketch each frame.
+    """
+    from mathutils import Vector
+
+    from ..model.constants import SketchCurveType
+    from ..model.curve_ref import _build_arc_bezier
+
+    if not sketch or not sketch.target_object or not sketch.target_object.data:
+        return
+
+    cd = sketch.target_object.data
+    n = len(cd.curves)
+    if n == 0:
+        return
+    if point_ids is not None and not point_ids:
+        return
+
+    # Adapt arc control-point counts to their current sweep angle. This may
+    # resize_curves (reindexing the point domain), so it must run before any
+    # per-point data below is read.
+    _resegment_arcs(sketch, cd, point_ids)
+
+    type_attr = cd.attributes.get("sketch_type")
+    if not type_attr:
+        return
+
+    # Bulk-read the relationship ids once (get_uuid does 4 attribute lookups
+    # per call, so per-segment reads add up in this per-frame hot path).
+    sp_ids = read_uuid_list(cd, "start_point_id")
+    ep_ids = read_uuid_list(cd, "end_point_id")
+    cp_ids = read_uuid_list(cd, "center_point_id")
+
+    # Map point curve_id -> local 2D position once, so segment endpoints resolve
+    # by dict lookup instead of a PointRef per endpoint (each of which re-resolved
+    # curve data twice). This is the bulk of solve's per-edit cost (issue #342).
+    cid_list = read_uuid_list(cd, "curve_id")
+    point_co = {}
+    for i in range(n):
+        if type_attr.data[i].value == SketchCurveType.POINT:
+            cs = cd.curves[i]
+            if cs.points_length:
+                p = cd.points[cs.points[0].index].position
+                point_co[cid_list[i]] = Vector((p[0], p[1]))
+
+    # Handle attributes are the same collection for every segment; fetch once
+    # rather than re-resolving them by name inside the per-segment loop below.
+    handle_left = cd.attributes.get("handle_left")
+    handle_right = cd.attributes.get("handle_right")
+
+    for i in range(n):
+        ctype = type_attr.data[i].value
+        if ctype == SketchCurveType.POINT:
+            continue
+
+        # Scoped rebuild: skip segments that don't touch a changed point.
+        if point_ids is not None and not (
+            sp_ids[i] in point_ids or ep_ids[i] in point_ids or cp_ids[i] in point_ids
+        ):
+            continue
+
+        curve_slice = cd.curves[i]
+
+        # A native edit can leave a segment with too few points (e.g. an
+        # endpoint deleted in Edit Mode). Skip such degenerate curves rather
+        # than indexing past their point count.
+        min_points = 2 if ctype == SketchCurveType.LINE else 1
+        if curve_slice.points_length < min_points:
+            continue
+
+        if ctype == SketchCurveType.LINE:
+            sp_co = point_co.get(sp_ids[i])
+            ep_co = point_co.get(ep_ids[i])
+            hl = handle_left
+            hr = handle_right
+            if sp_co is not None:
+                pos = (sp_co.x, sp_co.y, 0.0)
+                idx = curve_slice.points[0].index
+                cd.points[idx].position = pos
+                if hl:
+                    hl.data[idx].vector = pos
+                if hr:
+                    hr.data[idx].vector = pos
+            if ep_co is not None:
+                pos = (ep_co.x, ep_co.y, 0.0)
+                idx = curve_slice.points[1].index
+                cd.points[idx].position = pos
+                if hl:
+                    hl.data[idx].vector = pos
+                if hr:
+                    hr.data[idx].vector = pos
+
+        elif ctype in (SketchCurveType.ARC, SketchCurveType.CIRCLE):
+            ct_co = point_co.get(cp_ids[i])
+            if ct_co is None:
+                continue
+            is_cyclic = ctype == SketchCurveType.CIRCLE
+            if is_cyclic:
+                edge = Vector(cd.points[curve_slice.points[0].index].position[:2])
+                _build_arc_bezier(cd, i, ct_co, edge, edge, is_cyclic=True)
+            else:
+                s_co = point_co.get(sp_ids[i])
+                e_co = point_co.get(ep_ids[i])
+                if s_co is not None and e_co is not None:
+                    _build_arc_bezier(cd, i, ct_co, s_co, e_co)
+
+    # Weld ids depend on connectivity (start/end_point_id), not positions, so
+    # only recompute on a full rebuild -- a scoped move leaves topology intact.
+    if point_ids is None:
+        compute_merge_ids(sketch)
+
+
+def normalize_point_curve_types(curve_data) -> None:
+    """Give every single-point curve the spline type its segments use.
+
+    A standalone sketch point is a curve of one point, and Blender crashes
+    outright evaluating one whose spline type differs from the rest of the
+    datablock: a point added to a sketch that already holds a segment brought the
+    whole session down (adding a coincident or midpoint constraint is when a user
+    meets that, since both start from a loose point). A one-point curve has
+    nothing to interpolate, so its type is free to follow the segments': BEZIER in
+    a normal sketch, POLY in a native 3D one.
+    """
+    curves = curve_data.curves
+    n_curves = len(curves)
+    if n_curves == 0:
+        return
+
+    type_attr = curve_data.attributes.get("curve_type")
+    if type_attr is None:
+        return
+
+    lengths = np.empty(n_curves, dtype=np.int32)
+    curves.foreach_get("points_length", lengths)
+    types = np.empty(n_curves, dtype=np.int32)
+    type_attr.data.foreach_get("value", types)
+
+    single = np.flatnonzero(lengths < 2)
+    segments = np.flatnonzero(lengths >= 2)
+    if not len(single):
+        return
+
+    # Whatever the segments are; BEZIER is what a sketch built by the 2D tools
+    # uses, and the fallback when a sketch holds nothing but points.
+    wanted = int(types[segments[0]]) if len(segments) else CURVE_TYPE_BEZIER
+    stale = [int(i) for i in single if types[i] != wanted]
+    if stale:
+        curve_data.set_types(type=CURVE_TYPE_NAMES[wanted], indices=stale)
+
+
+def geometry_fingerprint(sketch):
+    """A digest of a sketch's curve topology, positions and numeric attributes.
+
+    None when the sketch has no curve data.
+    """
+    import hashlib
+
+    obj = sketch.target_object if sketch else None
+    curve_data = obj.data if obj else None
+    if curve_data is None:
+        return None
+    n_curves = len(curve_data.curves)
+    n_points = len(curve_data.points)
+    h = hashlib.blake2b(digest_size=16)
+    h.update(np.array([n_curves, n_points], dtype=np.int64).tobytes())
+    counts = np.zeros(n_curves, dtype=np.int32)
+    curve_data.curves.foreach_get("points_length", counts)
+    h.update(counts.tobytes())
+    for attr in curve_data.attributes:
+        domain_len = n_points if attr.domain == "POINT" else n_curves
+        if attr.data_type == "FLOAT_VECTOR":
+            data, key = np.zeros(domain_len * 3, dtype=np.float32), "vector"
+        elif attr.data_type == "BOOLEAN":
+            data, key = np.zeros(domain_len, dtype=np.bool_), "value"
+        elif attr.data_type in ("INT", "INT8"):
+            data, key = np.zeros(domain_len, dtype=np.int32), "value"
+        elif attr.data_type in ("INT32_2D", "INT16_2D"):
+            data, key = np.zeros(domain_len * 2, dtype=np.int32), "value"
+        elif attr.data_type == "FLOAT":
+            data, key = np.zeros(domain_len, dtype=np.float32), "value"
+        else:
+            h.update(f"{attr.name}:{attr.data_type}".encode())
+            continue
+        attr.data.foreach_get(key, data)
+        h.update(attr.name.encode())
+        h.update(data.tobytes())
+    return h.digest()
+
+
+def refresh_curve_geometry(sketch):
+    """Force GN modifier re-evaluation by doing a topology rebuild."""
+    if not sketch or not sketch.target_object or not sketch.target_object.data:
+        return
+
+    curve_data = sketch.target_object.data
+    n_curves = len(curve_data.curves)
+    if n_curves == 0:
+        return
+
+    # Refresh weld ids before the rebuild so they're saved/restored current; this
+    # is the sync point right before the GN convert re-evaluates.
+    compute_merge_ids(sketch)
+
+    # Keep either conversion path current. On 5.0 this attaches the same stable
+    # id tail to the loaded merge-by-distance asset; on 5.2+ it rebuilds a stale
+    # programmatic group in place.
+    _get_convert_node_group()
+
+    n_points = len(curve_data.points)
+    point_counts = np.zeros(n_curves, dtype=np.int32)
+    curve_data.curves.foreach_get("points_length", point_counts)
+
+    positions = np.zeros(n_points * 3, dtype=np.float32)
+    curve_data.points.foreach_get("position", positions)
+
+    saved_attrs = {}
+    for attr in curve_data.attributes:
+        if attr.name == "position":
+            continue
+        domain_len = n_points if attr.domain == "POINT" else n_curves
+        if attr.data_type == "FLOAT_VECTOR":
+            data = np.zeros(domain_len * 3, dtype=np.float32)
+            attr.data.foreach_get("vector", data)
+        elif attr.data_type == "BOOLEAN":
+            data = np.zeros(domain_len, dtype=np.bool_)
+            attr.data.foreach_get("value", data)
+        elif attr.data_type in ("INT", "INT8"):
+            data = np.zeros(domain_len, dtype=np.int32)
+            attr.data.foreach_get("value", data)
+        elif attr.data_type in ("INT32_2D", "INT16_2D"):
+            data = np.zeros(domain_len * 2, dtype=np.int32)
+            attr.data.foreach_get("value", data)
+        elif attr.data_type == "FLOAT":
+            data = np.zeros(domain_len, dtype=np.float32)
+            attr.data.foreach_get("value", data)
+        elif attr.data_type == "STRING":
+            data = [attr.data[i].value for i in range(domain_len)]
+        else:
+            continue
+        saved_attrs[attr.name] = {
+            "data": data,
+            "type": attr.data_type,
+            "domain": attr.domain,
+        }
+
+    curve_data.remove_curves()
+    curve_data.add_curves(point_counts.tolist())
+    curve_data.set_types(type="BEZIER")
+    ensure_standard_attributes(curve_data)
+
+    curve_data.points.foreach_set("position", positions)
+    for name, info in saved_attrs.items():
+        attr = curve_data.attributes.get(name)
+        if not attr:
+            attr = curve_data.attributes.new(
+                name, type=info["type"], domain=info["domain"]
+            )
+        if info["type"] == "STRING":
+            for i, v in enumerate(info["data"]):
+                attr.data[i].value = v
+        elif info["type"] == "FLOAT_VECTOR":
+            attr.data.foreach_set("vector", info["data"])
+        else:
+            attr.data.foreach_set("value", info["data"])
+
+    # The restore above puts the saved curve_type back, which is what keeps a
+    # native 3D sketch's POLY curves linear -- and what carries a single-point
+    # curve's type over from whenever it was added.
+    normalize_point_curve_types(curve_data)

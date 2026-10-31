@@ -1,0 +1,1533 @@
+from contextlib import nullcontext
+from typing import Any
+
+import bpy
+from bpy.props import BoolProperty, IntProperty
+from bpy.types import Context, Event
+from mathutils import Vector
+
+from .. import global_data
+from .state_machine import _StateMachineMixin
+from .utilities import continuation
+from .utilities.description import state_desc, stateful_op_desc
+from .utilities.generic import to_list
+from .utilities.keymap import get_key_map_desc, is_numeric_input, is_unit_input
+from .utilities.numeric import NumericInput, parse_numeric
+from .utilities.switch import CANCEL, FORWARD, SWITCH, key_action
+
+# Re-export so any `from .logic import _NumericInput` keeps working.
+_NumericInput = NumericInput
+
+
+class StatefulOperatorLogic(_StateMachineMixin):
+    """Stateful operator behaviour: numeric input, modal loop, undo, continuous draw.
+
+    Inherits the pure state machine from ``_StateMachineMixin``.
+
+    Lifecycle (modal path)
+    ----------------------
+    invoke → prefill_state_props (optional) → modal loop:
+        modal → evaluate_state → [next_state | _end | do_continuous_draw]
+
+    Lifecycle (redo/execute path)
+    -----------------------------
+    execute → redo_states → main → _end
+    """
+
+    state_index: IntProperty(options={"HIDDEN", "SKIP_SAVE"})
+    wait_for_input: BoolProperty(options={"HIDDEN", "SKIP_SAVE"}, default=True)
+    continuous_draw: BoolProperty(name="Continuous Draw", default=False)
+    # >= 0 -> re-enter to edit just that state: restore the persisted input, let
+    # the user re-pick that one state, then re-apply idempotently. -1 = normal.
+    edit_state: IntProperty(default=-1, options={"HIDDEN", "SKIP_SAVE"})
+    # With edit_state, drop that state's pick and go back to its own value
+    # (e.g. a line endpoint stops following a point and keeps its location).
+    edit_clear: BoolProperty(default=False, options={"HIDDEN", "SKIP_SAVE"})
+
+    executed = False
+    # Tool id to activate once the operator succeeds (see _end). Lets a one-off
+    # tool return to a select tool afterwards instead of lingering; None keeps
+    # the current tool. On failure/cancel the tool is left alone so a missed
+    # pick can be retried.
+    return_to_tool = None
+    # Screen coords when a state first runs — used by state_func for delta/scale
+    state_init_coords = None
+    _last_coords = Vector((0, 0))
+    _undo = False
+    _state_snapshot = None
+    # Opt in to updating an unchanged preview in place (see update_preview).
+    preview_in_place = False
+    # Structure of the preview currently shown, or None when it must be rebuilt.
+    _preview_key = None
+    # Global axis constraint (0=X, 1=Y, 2=Z, or None) for the current vector
+    # state, toggled with the X/Y/Z keys and applied by the state's state_func.
+    _axis_lock = None
+    # Formatted live value of the current state, shown in the status bar.
+    _status_value = None
+    # The resolved values behind _status_value, which the value boxes are
+    # placed from (see state_value_spans).
+    _status_values = ()
+    # The point this state's value is measured from, when it has one.
+    _status_origin = None
+    # Where the left mouse button went down, to tell a drag from a click.
+    _press_coords = None
+    # Set once a dragged release confirmed a state: from then on the release
+    # confirms and a press only starts the next drag (see check_event).
+    _drag_mode = False
+    # The invoking click already confirmed the first state (see invoke).
+    _invoked_by_click = False
+    # A continuous-draw chain committed at least one segment, so ending the
+    # chain still counts as a finished operator (see _end).
+    _chain_committed = False
+    # That segment's properties, so the redo panel adjusts it and not the
+    # segment the chain was in the middle of when it ended.
+    _committed_props = None
+    # This operator's first state can carry on from the point another tool's
+    # chain reached, so switching tools mid-chain keeps drawing the same run of
+    # geometry (see _seed_from_chain). Only for operators whose first state is a
+    # pointer the chain's last one fits, e.g. a line or an arc starting where
+    # the previous segment ended.
+    accepts_chain = False
+
+    # -------------------------------------------------------------------------
+    # Snapshot / undo hooks (override in subclasses)
+    # -------------------------------------------------------------------------
+
+    def create_snapshot(self, context: Context) -> Any:
+        """Return a snapshot of state to restore on cancel/undo.
+
+        Return ``None`` to fall back to Blender's undo system.
+        """
+        return None
+
+    def restore_snapshot(self, context: Context, snapshot: Any) -> None:
+        """Restore state from a snapshot produced by ``create_snapshot``."""
+        pass
+
+    def on_before_redo_states(self, context: Context):
+        """Called before ``redo_states`` during undo/redo cycles.
+
+        Override to clear transient state that must be rebuilt
+        (e.g. entity ignore lists used by draw handlers).
+        """
+        pass
+
+    # -------------------------------------------------------------------------
+    # State transitions (depend on numeric + status text — stay here)
+    # -------------------------------------------------------------------------
+
+    def set_state(self, context: Context, index: int):
+        self.state_index = index
+        self.init_numeric(False)
+        self._axis_lock = None
+        self._status_value = None
+        self.set_status_text(context)
+        # Publish the new state's accepted pick types so the hover gizmo
+        # highlights what this state will pick. Clear any existing hover when
+        # the new state picks nothing (a property/interactive state), since it
+        # consumes mouse-moves and the gizmo won't fire to clear it.
+        global_data.hover_types = self.get_states()[index].types
+        if not global_data.hover_types:
+            global_data.hover_element = None
+
+    def next_state(self, context: Context):
+        self._undo = False
+        self._preview_key = None
+        self.state_init_coords = None
+        i = self.state_index
+        if (i + 1) >= len(self.get_states()):
+            return False
+        self.set_state(context, i + 1)
+        return True
+
+    # -------------------------------------------------------------------------
+    # Numeric input — delegates to self._numeric (NumericInput)
+    # -------------------------------------------------------------------------
+
+    def _status_line(self, text: str) -> str:
+        """Head a status-bar line with the operator's own name.
+
+        The status bar is what a user reads mid-tool, and a bare "Entity 1: ..."
+        doesn't say which tool is asking for it -- the prompts of two tools are
+        often worded the same.
+        """
+        label = getattr(self, "bl_label", "")
+        return "{}    {}".format(label, text) if label else text
+
+    def set_status_text(self, context: Context):
+        state = self.state
+        desc = (
+            state.description(self, state)
+            if callable(state.description)
+            else state.description
+        )
+
+        msg = state_desc(state.name, desc, state.types)
+        if self._numeric.is_active:
+            prop = self._numeric.prop
+            index = self._numeric.substate_index
+            array_length = prop.array_length if prop.array_length else 1
+
+            if prop.type == "FLOAT":
+                display = [0.0] * array_length
+                for key in range(array_length):
+                    val = self._numeric.get(key)
+                    display[key] = val if val else 0.0
+                display[index] = "*" + str(display[index])
+                display_str = str(display).replace('"', "").replace("'", "")
+                msg += "    {}: {}".format(prop.subtype, display_str)
+            elif prop.type == "INT":
+                msg += "    {}: {}".format(prop.subtype, self._numeric.current)
+        elif self._status_value:
+            # Live value while modifying a state (property or point placement).
+            msg += "    {}: {}".format(state.name, self._status_value)
+
+        if self._axis_lock is not None:
+            msg += "    [{} axis]".format("XYZ"[self._axis_lock])
+
+        context.workspace.status_text_set(self._status_line(msg))
+        self._publish_state_value(context)
+
+    def state_value_origin(self, context: Context):
+        """The point this state places relative to, in its own coordinates.
+
+        ``None`` when the state stands alone, and the value is then whatever it
+        resolves to. A subclass that knows its geometry overrides this (see
+        ``Operator2d``).
+        """
+        return None
+
+    def state_value_spans(self, context: Context, values, count: int):
+        """The stretch each of this state's ``count`` values measures.
+
+        One ``(start, end)`` pair of world points per box: the leg the value is
+        the length of, which is drawn as a dimension line with arrowheads and
+        extension lines, the way a finished dimension is. A pair with both ends
+        the same has no length to show, and its value is just written there.
+
+        ``count`` is 1 while the value is only being dragged, and the number of
+        components once each is being typed separately. The framework has no
+        idea where an operator's geometry is, so it offers nothing; a subclass
+        that does know overrides this (see ``Operator2d``). A list shorter than
+        ``count`` draws nothing.
+        """
+        return []
+
+    def _state_value_texts(self):
+        """The text for each box, and which one has focus.
+
+        One text per number the state resolves to, so each is dimensioned
+        against the stretch it measures: a rectangle reads its width along one
+        edge and its height along the other, dragged or not. Typing replaces
+        the ones typed into and leaves the rest following the mouse, which is
+        what makes "type the width, tab, drag the height" work.
+
+        The first value is boxed before anything is typed, because that is
+        where a digit would land: the box is what says a value can be typed at
+        all, and which one Tab moves away from.
+        """
+        if not self._numeric.is_active:
+            texts = self._value_texts(self._status_values)
+            if any(texts):
+                return texts, 0
+            return ([self._status_value], 0) if self._status_value else ([], -1)
+
+        count = max(1, self._numeric.substate_count or 1)
+        dragged = self._value_texts(self._status_values)
+        texts = []
+        for index in range(count):
+            typed = self._numeric.get(index)
+            texts.append(typed or (dragged[index] if index < len(dragged) else ""))
+        return texts, self._numeric.substate_index
+
+    def _publish_state_value(self, context: Context) -> None:
+        """Hand the live value(s) to the draw handler, to show by the geometry.
+
+        Only the numbers are published, not the state's name: they are drawn
+        against the thing being placed, which says what each one measures
+        better than a label would.
+        """
+        from bpy_extras.view3d_utils import location_3d_to_region_2d
+
+        from ..utilities.preferences import get_prefs
+
+        region = context.region
+        region_data = getattr(context, "region_data", None)
+        if region is None or region_data is None:
+            global_data.state_value = None
+            return
+        if not get_prefs().show_state_value:
+            global_data.state_value = None
+            return
+
+        texts, focused = self._state_value_texts()
+        if not texts or not any(texts):
+            global_data.state_value = None
+            return
+
+        spans = self.state_value_spans(context, self._status_values, len(texts))
+        if len(spans) < len(texts):
+            global_data.state_value = None
+            return
+
+        def focus(index: int) -> int:
+            """How a box is drawn: not focused, ready to type into, or typed in."""
+            if index != focused:
+                return global_data.BOX_PLAIN
+            if self._numeric.is_active:
+                return global_data.BOX_EDITING
+            return global_data.BOX_ACTIVE
+
+        boxes = []
+        for index, text in enumerate(texts):
+            ends = [
+                location_3d_to_region_2d(region, region_data, point)
+                for point in spans[index]
+            ]
+            if any(end is None for end in ends):
+                # Behind the viewer in a perspective view.
+                global_data.state_value = None
+                return
+            boxes.append((str(text), ends[0], ends[1], focus(index)))
+
+        global_data.state_value = (tuple(boxes), region.as_pointer())
+
+    def _format_number(self, value: float, subtype) -> str:
+        """One number as text, in the units the scene is set to.
+
+        A length or an angle is read against the scene's units everywhere else
+        in the add-on (a dimension's label, the sidebar), so a tool's own live
+        value is shown the same way rather than as raw Blender units.
+        """
+        from .. import units
+
+        if subtype in ("DISTANCE", "DISTANCE_CAMERA"):
+            return units.format_distance(value)
+        if subtype == "ANGLE":
+            return units.format_angle(value)
+        return "{:.3f}".format(value)
+
+    def _format_values(self, values):
+        """Format resolved state values (vectors / floats / ints) for display."""
+        texts = self._value_texts(values)
+        return ", ".join(texts) if len(texts) == 1 else "(" + ", ".join(texts) + ")"
+
+    def _value_texts(self, values):
+        """One string per number this state resolves to.
+
+        A point placed relative to another is described by how far it reaches
+        along each axis, not by its coordinate: that is what the value boxes sit
+        against, and what a number typed into one means.
+        """
+        props = self.get_property() or []
+        origin = self._status_origin
+        texts = []
+        for i, value in enumerate(values):
+            subtype = None
+            if i < len(props):
+                prop = self.rna_type.properties.get(props[i])
+                subtype = prop.subtype if prop else None
+            if hasattr(value, "__len__") and not isinstance(value, str):
+                # A coordinate's components are lengths; anything else is a
+                # plain tuple of numbers.
+                component = "DISTANCE" if subtype in ("XYZ", "TRANSLATION") else None
+                for axis, number in enumerate(value):
+                    if origin is not None and axis < len(origin):
+                        number = number - origin[axis]
+                    texts.append(self._format_number(number, component))
+            elif isinstance(value, float):
+                texts.append(self._format_number(value, subtype))
+            else:
+                texts.append(str(value))
+        return texts
+
+    def check_numeric(self):
+        """Return True if the current state supports numeric text entry."""
+        # TODO: Allow to define custom logic
+        props = self.get_property()
+        if not props or len(props) > 1:
+            return False
+        prop_name = props[0]
+        if not prop_name:
+            return False
+        prop = self.properties.rna_type.properties.get(prop_name)
+        if not prop:
+            return False
+        return prop.type in ("INT", "FLOAT")
+
+    def init_numeric(self, is_numeric: bool) -> bool:
+        self._numeric.reset()
+        if not is_numeric:
+            self._init_substate()
+            return False
+        ok = self.check_numeric()
+        self._numeric.is_active = ok
+        self._init_substate()
+        return ok
+
+    def _init_substate(self):
+        """Resolve the rna property for the current state and cache it on _numeric."""
+        props = self.get_property()
+        if not props or not props[0]:
+            return
+        prop = self.properties.rna_type.properties.get(props[0])
+        self._numeric.init_substate(prop)
+
+    # Public wrappers — kept for API compatibility with operator subclasses
+
+    def iterate_substate(self):
+        self._numeric.iterate()
+
+    @property
+    def numeric_input(self) -> str:
+        return self._numeric.current
+
+    @numeric_input.setter
+    def numeric_input(self, value: str):
+        self._numeric.current = value
+
+    def evaluate_numeric_event(self, event: Event):
+        self._numeric.evaluate_event(event)
+
+    def validate_numeric_input(self, value: str) -> str:
+        return self._numeric._validate(value)
+
+    def get_numeric_value(self, context: Context, coords):
+        """Convert the current numeric text buffer to a typed value (or list)."""
+        prop_name = self.get_property()[0]
+        prop = self.properties.rna_type.properties[prop_name]
+        unit_system = context.scene.unit_settings.system
+
+        def to_iterable(item):
+            if hasattr(item, "__iter__") or hasattr(item, "__getitem__"):
+                return list(item)
+            return [item]
+
+        size = max(1, self._numeric.substate_count or 0)
+
+        # TODO: Don't evaluate interactive value if not needed
+        interactive_val = self._get_state_values(context, self.state, coords)
+        if interactive_val is None:
+            interactive_val = [None] * size
+        else:
+            interactive_val = to_iterable(interactive_val)
+
+        origin = self.state_value_origin(context) if size > 1 else None
+
+        storage = [None] * size
+        result = [None] * size
+        for sub_index in range(size):
+            raw = self._numeric.get(sub_index)
+            if raw:
+                num = parse_numeric(prop, raw, unit_system)
+                if num is None:
+                    num = prop.default
+                # Typed into a box that measures from somewhere: it says how far
+                # to reach, not where to land.
+                if origin is not None and sub_index < len(origin):
+                    num = origin[sub_index] + num
+                result[sub_index] = num
+                storage[sub_index] = num
+            elif interactive_val[sub_index] is not None:
+                result[sub_index] = interactive_val[sub_index]
+            else:
+                result[sub_index] = prop.default
+
+        self.state_data["numeric_input"] = storage
+        return result[0] if not self._numeric.substate_count else result
+
+    # -------------------------------------------------------------------------
+    # Selection prefill
+    # -------------------------------------------------------------------------
+
+    def prefill_state_props(self, context: Context):
+        selected = self.gather_selection(context)
+
+        while True:
+            index = self.state_index
+            state = self.state
+            self.get_state_data(index)
+
+            if not state.allow_prefill:
+                break
+
+            func = self.get_func(state, "parse_selection")
+            result = func(context, selected, index=index)
+
+            if result:
+                if not self.next_state(context):
+                    return {"FINISHED"}
+                continue
+            break
+        return {"RUNNING_MODAL"}
+
+    # -------------------------------------------------------------------------
+    # Operator lifecycle — invoke / modal / execute / _end
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def drag_threshold() -> float:
+        """Pixels the cursor must travel while pressed to count as a drag.
+
+        Blender's mouse threshold (3px by default) is meant for gestures and is
+        small enough that the wobble of a normal click reads as a drag, which
+        would switch the tool to press-drag-release by accident. Use the general
+        drag threshold instead (Preferences > Input > Drag Threshold), scaled like
+        Blender scales its own.
+        """
+        prefs = bpy.context.preferences
+        inputs = prefs.inputs
+        threshold = max(inputs.drag_threshold, inputs.drag_threshold_mouse)
+        # ui_scale reads 0 with no UI (background runs), which would make every
+        # click a drag.
+        return threshold * (prefs.system.ui_scale or 1.0)
+
+    def _is_drag(self, event) -> bool:
+        """Whether the cursor left the drag threshold since the last press."""
+        if self._press_coords is None:
+            return False
+        coords = Vector((event.mouse_region_x, event.mouse_region_y))
+        return (coords - self._press_coords).length > self.drag_threshold()
+
+    def check_event(self, event):
+        # Both click-move-click and press-drag-release confirm states. A press
+        # confirms, and so does a release after dragging, which switches the run
+        # to drag mode: a press then only starts the next drag, so dragging again
+        # doesn't also confirm a point where the button went down.
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            self._press_coords = Vector((event.mouse_region_x, event.mouse_region_y))
+            return not self._drag_mode
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            if self._press_coords is None:
+                return False
+            confirm = self._drag_mode or self._is_drag(event)
+            self._drag_mode = confirm
+            self._press_coords = None
+            return confirm
+        if event.type in ("RET", "NUMPAD_ENTER") and event.value == "PRESS":
+            return True
+        if self.state_index == 0 and not self.wait_for_input:
+            if self._invoked_by_click:
+                return False
+            return not self._numeric.is_active
+        if self.state.no_event:
+            return True
+        return False
+
+    def invoke(self, context: Context, event: Event):
+        global_data.stateful_op_running = True
+        self._state_data.clear()
+        self._numeric = NumericInput()
+        self._press_coords = None
+        self._drag_mode = False
+        self._invoked_by_click = False
+
+        if self.edit_state >= 0:
+            return self._invoke_edit(context, event)
+
+        entered_modal = False
+        global_data.hover_types = self.get_states()[0].types
+        self._state_snapshot = self.create_snapshot(context)
+        try:
+            if hasattr(self, "init"):
+                if not self.init(context, event):
+                    return self._end(context, False)
+            self._capture_baseline(context)
+
+            retval = {"RUNNING_MODAL"}
+            go_modal = True
+
+            if self._seed_from_chain(context):
+                # Standing at the second state already, with the chain's point
+                # behind it: wait for input like any other tool start.
+                pass
+
+            elif is_numeric_input(event):
+                if self.init_numeric(True):
+                    self._numeric.evaluate_event(event)
+                    self.evaluate_state(context, event, False)
+
+            # A tool click confirms the first state right where the button went
+            # down, so dragging from there and releasing sets the next one.
+            elif (
+                not self.wait_for_input
+                and event.type == "LEFTMOUSE"
+                and event.value == "PRESS"
+            ):
+                coords = Vector((event.mouse_region_x, event.mouse_region_y))
+                self._press_coords = coords
+                self._last_coords = coords
+                self._invoked_by_click = True
+                retval = self.evaluate_state(context, event, True)
+                if retval != {"RUNNING_MODAL"}:
+                    # The click already finished (or cancelled) the operator.
+                    return retval
+
+            # wait_for_input=True: respect selection for prefill, but wait for LMB
+            elif self.wait_for_input:
+                retval = self.prefill_state_props(context)
+                if retval == {"FINISHED"}:
+                    go_modal = False
+                if not self.executed and self.check_props():
+                    with self.batched_changes(context):
+                        self.run_op(context)
+                    self.executed = True
+                context.area.tag_redraw()
+
+            self.set_status_text(context)
+
+            if go_modal:
+                context.window.cursor_modal_set("CROSSHAIR")
+                context.window_manager.modal_handler_add(self)
+                entered_modal = True
+                return retval
+
+            succeede = retval == {"FINISHED"}
+            # NOTE: Pushing an undo step here causes duplicated constraints after redo.
+            return self._end(context, succeede)
+        finally:
+            if not entered_modal and global_data.stateful_op_running:
+                global_data.stateful_op_running = False
+
+    # -------------------------------------------------------------------------
+    # Edit-state re-entry (re-pick one state of a finished op, idempotently)
+    # -------------------------------------------------------------------------
+
+    def _invoke_edit(self, context: Context, event: Event):
+        """Re-enter to edit a single state: restore the persisted input, then let
+        the user re-pick just ``edit_state``. Invoked top-level from the redo
+        panel, so the re-applied op becomes the adjustable last operation."""
+        if hasattr(self, "init"):
+            # Load assets etc.; entity ops also set _active_sketch here.
+            if not self.init(context, event):
+                return self._end_edit(context, False)
+        # Rebuild every state from the forwarded/persisted props, then clear the
+        # one being edited so the user picks it fresh. No snapshot -- idempotent
+        # apply (_run_main) replaces this op's own output.
+        self._state_snapshot = None
+        self._restore_pointers()
+        # Clearing needs no pick, but still runs through the modal: an operator
+        # that finishes inside invoke() is not recorded as the adjustable last
+        # operation, so the redo panel would keep showing the old pick.
+        self._pending_clear = bool(self.edit_clear)
+        # Let subclasses snapshot pre-re-pick state (the target being edited away
+        # from) before the user changes it -- e.g. node ops relocating a modifier.
+        self._prepare_edit(context)
+        i = self.edit_state
+        # The pick runs in state i, but the re-apply must rebuild every state.
+        self._edit_full_state_index = self.state_index
+        self._reset_edited_state(i)
+        self.set_state(context, i)
+        global_data.hover_types = self.get_states()[i].types
+        # Make the op's hover/preselection UI available for the re-pick even
+        # though the workspace tool that normally owns it isn't active.
+        self._prepare_pick_ui(context)
+        # The same cursor the tool draws with: re-picking is the very same click
+        # on the very same targets, just outside the drawing run.
+        context.window.cursor_modal_set("CROSSHAIR")
+        self._set_edit_status(context)
+        # A modal invoked from a redo-panel button can stall waiting for its first
+        # event (the button-click context delivers none until the mouse moves).
+        # A modal timer keeps it ticking so it becomes responsive immediately.
+        self._edit_timer = context.window_manager.event_timer_add(
+            0.05, window=context.window
+        )
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def _reset_edited_state(self, i: int) -> None:
+        """Blank state ``i`` so it can be picked fresh.
+
+        A clear keeps the picked type: the value it falls back to is read from
+        the pick itself (see ``pick_fallback_value``), so dropping the type would
+        leave the state with nothing to fall back to and the clear would do
+        nothing.
+        """
+        if self._pending_clear:
+            return
+        self.get_state_data(i).pop("type", None)
+
+    def _set_edit_status(self, context: Context):
+        """Tell the user a re-pick is in progress and what to click.
+
+        Shown in the viewport header, where it's hard to miss, and in the status
+        bar with how to cancel. The status bar is re-asserted every event: the
+        redo panel's re-run of the previous operator clears it.
+        """
+        from .utilities.description import pick_types_label
+
+        state = self.state
+        text = "Re-pick {}: click a {}".format(
+            state.name, pick_types_label(state.types)
+        )
+        if context.area:
+            context.area.header_text_set(text)
+        context.workspace.status_text_set(
+            self._status_line(text + "    Esc / Right-click: cancel")
+        )
+
+    def _clear_pick(self, context: Context):
+        """Turn state ``edit_state``'s pick back into its own value and re-apply."""
+        i = self.edit_state
+        value = self.pick_fallback_value(context, i)
+        props = self.get_property(index=i) or ()
+        if value is None or not props:
+            return self._end_edit(context, False)
+        for name in props:
+            setattr(self, name, value)
+        data = self.get_state_data(i)
+        data["is_existing_entity"] = False
+        data.pop("curve_id", None)
+        self.state_index = max(self._edit_full_state_index, self.state_index)
+        ok = self._reapply(context)
+        self._run_fini(context, ok)
+        if ok:
+            self._store_pointers()
+            self._record_committed_output(context)
+        if context.area:
+            context.area.tag_redraw()
+        return self._end_edit(context, ok)
+
+    def pick_fallback_value(self, context: Context, i):
+        """Hook: the value a cleared pick falls back to, or None if it has none."""
+        return None
+
+    def _modal_edit(self, context: Context, event: Event):
+        if getattr(self, "_pending_clear", False):
+            self._pending_clear = False
+            return self._clear_pick(context)
+        # Clicking the eyedropper button in the redo panel makes Blender also
+        # re-run the previous operator's execute()/_end() (an implicit undo +
+        # re-apply). That nulls the shared global_data.hover_types this edit modal
+        # set, restores the cursor this modal set, and reverts any state
+        # _prepare_pick_ui changed (e.g. a hidden modifier). Re-assert them every
+        # event so the pick keeps working and keeps looking like a pick.
+        global_data.hover_types = self.get_states()[self.edit_state].types
+        context.window.cursor_modal_set("CROSSHAIR")
+        self._maintain_pick_ui(context)
+        self._set_edit_status(context)
+        if event.type in {"RIGHTMOUSE", "ESC"} and event.value == "PRESS":
+            return self._end_edit(context, False)
+        if event.type == "TIMER":
+            return {"RUNNING_MODAL"}  # just keeps the modal responsive
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            coords = Vector((event.mouse_region_x, event.mouse_region_y))
+            is_picked, values = self._pick_hovered(context, coords, self.state, False)
+            if not is_picked:
+                return {"RUNNING_MODAL"}  # missed a target -- keep waiting
+            self.state_data["is_existing_entity"] = True
+            self.set_state_pointer(values, implicit=True)
+            self._store_pointers()
+            self.state_index = max(self._edit_full_state_index, self.state_index)
+            ok = self._reapply(context)
+            # Finish like any other run (fini adds a tool's follow-up constraints
+            # and solves), then record the output this run created.
+            self._run_fini(context, ok)
+            if ok:
+                self._record_committed_output(context)
+            if context.area:
+                context.area.tag_redraw()
+            return self._end_edit(context, ok)
+        if event.type == "MOUSEMOVE":
+            # Gizmos don't run their hover test while a modal operator is active,
+            # so drive the hover highlight ourselves for the re-pick.
+            coords = Vector((event.mouse_region_x, event.mouse_region_y))
+            self._update_pick_hover(context, coords)
+        return self._handle_pass_through(context, event)
+
+    def _end_edit(self, context: Context, ok: bool):
+        timer = getattr(self, "_edit_timer", None)
+        if timer is not None:
+            context.window_manager.event_timer_remove(timer)
+            self._edit_timer = None
+        self._finish_pick_ui(context)
+        context.window.cursor_modal_restore()
+        if context.area:
+            context.area.header_text_set(None)
+        context.workspace.status_text_set(None)
+        global_data.state_value = None
+        global_data.hover_types = None
+        global_data.hover_element = None
+        global_data.stateful_op_running = False
+        return {"FINISHED"} if ok else {"CANCELLED"}
+
+    def execute(self, context: Context):
+        # Rebuild from the persisted props alone. State data is shared between
+        # runs (one class-level dict, see _StateMachineMixin), so whatever the
+        # last run left there would win over the props in _restore_pointers --
+        # a redo after a continuous chain rebuilt the abandoned segment.
+        self._state_data.clear()
+        global_data.stateful_op_running = True
+        try:
+            self._numeric = NumericInput()
+            ok = self._reapply(context)
+            return self._end(context, ok, skip_undo=True)
+        finally:
+            if global_data.stateful_op_running:
+                global_data.stateful_op_running = False
+
+    def _run_main(self, context: Context):
+        """Invoke ``main``; a hook for subclasses to make apply idempotent
+        (e.g. entity ops that own + replace their created output)."""
+        return self.main(context)
+
+    def _run_fini(self, context: Context, succeede: bool) -> None:
+        """Call the operator's ``fini`` (the commit tail: follow-up constraints,
+        a solve). A hook so a subclass can wrap it, e.g. to keep what fini
+        creates part of the same idempotent re-apply."""
+        if hasattr(self, "fini"):
+            self.fini(context, succeede)
+
+    def _reapply(self, context: Context):
+        """Rebuild everything from persisted state and run main -- the shared
+        execute / redo-panel / edit-re-pick path. Default: redo_states + main.
+        Subclasses that own their output (Operator2d) remove it first so their
+        stable-id recreation doesn't collide with the still-present old copy."""
+        self.redo_states(context)
+        invalid = getattr(self, "_invalid_pointers", None)
+        if invalid:
+            self.report({"WARNING"}, "Invalid input for: " + ", ".join(invalid))
+            return False
+        return self._run_main(context)
+
+    def _prepare_edit(self, context: Context):
+        """Hook: called in the edit re-pick invoke, after the persisted state is
+        restored but before the user re-picks edit_state. Lets a subclass capture
+        what it is editing away from (default no-op)."""
+        pass
+
+    def _prepare_pick_ui(self, context: Context):
+        """Hook: called when the edit re-pick modal starts. Lets a subclass make
+        its hover/preselection UI available even though the workspace tool that
+        owns it isn't active (e.g. ensure a gizmo group is linked, or reveal
+        geometry a modifier is hiding). Default no-op."""
+        pass
+
+    def _finish_pick_ui(self, context: Context):
+        """Hook: called when the edit re-pick modal ends. Undo whatever
+        ``_prepare_pick_ui`` set up. Default no-op."""
+        pass
+
+    def _update_pick_hover(self, context: Context, coords):
+        """Hook: called on mouse-move during the edit re-pick to refresh the
+        hover highlight (gizmos don't run their hover test during a modal).
+        Default no-op."""
+        pass
+
+    def _maintain_pick_ui(self, context: Context):
+        """Hook: called on every edit-modal event to re-assert whatever
+        ``_prepare_pick_ui`` set up, since a redo-panel re-run can revert it.
+        Default no-op."""
+        pass
+
+    def _capture_baseline(self, context: Context):
+        """Hook: record the state before the op runs (for output ownership)."""
+        pass
+
+    def _record_committed_output(self, context: Context):
+        """Hook: after a successful commit, record what the op created."""
+        pass
+
+    def key_action(self, context: Context, event: Event) -> int:
+        """Return what a shortcut key does to this running tool (see switch)."""
+        return key_action(
+            context, event, exclude=self.bl_idname, is_same=self.is_same_invocation
+        )
+
+    def is_same_invocation(self, kmi) -> bool:
+        """Whether a keymap item calling this operator starts it as it runs now.
+
+        Such a key doesn't restart the running tool. Override when properties
+        make the same operator behave as different tools.
+        """
+        return True
+
+    @staticmethod
+    def _tag_redraw(context: Context) -> None:
+        """Repaint the view after a change no mouse move follows.
+
+        Moving the focus from box to box changes what is drawn without going
+        through ``evaluate_state``, which is what normally asks for a repaint.
+        """
+        area = getattr(context, "area", None)
+        if area is not None:
+            area.tag_redraw()
+
+    def _handle_pass_through(self, context: Context, event: Event):
+        if event.type in {"MIDDLEMOUSE", "WHEELUPMOUSE", "WHEELDOWNMOUSE", "MOUSEMOVE"}:
+            return {"PASS_THROUGH"}
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context: Context, event: Event):
+        if self.edit_state >= 0:
+            return self._modal_edit(context, event)
+
+        state = self.state
+        event_triggered = self.check_event(event)
+        coords = Vector((event.mouse_region_x, event.mouse_region_y))
+
+        is_numeric_edit = self._numeric.is_active
+        is_numeric_event = event.value == "PRESS" and is_numeric_input(event)
+
+        if is_numeric_edit:
+            if event.value == "PRESS" and is_unit_input(
+                event, self._numeric.current, self._numeric.prop
+            ):
+                is_numeric_event = True
+            elif event.type == "TAB" and event.value == "PRESS":
+                self._numeric.iterate()
+                self.set_status_text(context)
+                self._tag_redraw(context)
+        elif event.type == "TAB" and event.value == "PRESS":
+            # Tab opens the value boxes without a digit first, so a width can be
+            # tabbed past and only the height typed.
+            is_numeric_edit = self.init_numeric(True)
+            self.set_status_text(context)
+            self._tag_redraw(context)
+        elif is_numeric_event:
+            is_numeric_edit = self.init_numeric(True)
+
+        # Shortcuts that reach the keymap while this tool runs (see switch).
+        action = None if is_numeric_event else self.key_action(context, event)
+
+        # Undo drops the unfinished element like Esc; a second undo then works
+        # on the history as usual.
+        if event.type in {"RIGHTMOUSE", "ESC"} or action == CANCEL:
+            return self._end(context, False)
+
+        # Global axis constraint (X/Y/Z), only for states that opt in and apply
+        # self._axis_lock in their state_func — toggle and re-run so the preview
+        # updates.
+        if (
+            event.value == "PRESS"
+            and event.type in ("X", "Y", "Z")
+            and getattr(state, "axis_lock", False)
+        ):
+            axis = "XYZ".index(event.type)
+            self._axis_lock = None if self._axis_lock == axis else axis
+            self.set_status_text(context)
+            return self.evaluate_state(context, event, False)
+
+        # Another tool's shortcut ends this one, discarding the unfinished
+        # element like Esc does, and passes the key on so the keymap starts it.
+        # A toggle shortcut passes on while this tool keeps running.
+        if action == SWITCH:
+            self._offer_chain(context)
+            # Keep whatever verdict ending reached -- a chain that committed
+            # segments is a finished operator and keeps its redo panel -- and
+            # pass the key on so the keymap starts the other tool.
+            return (self._end(context, False) or {"CANCELLED"}) | {"PASS_THROUGH"}
+        if action == FORWARD:
+            return {"PASS_THROUGH"}
+
+        # HACK: calling ops.ed.undo() inside a modal triggers a spurious MOUSEMOVE.
+        # Check actual pixel movement to filter it out.
+        mousemove_threshold = 0.1
+        is_mousemove = (coords - self._last_coords).length > mousemove_threshold
+        self._last_coords = coords
+
+        if not event_triggered:
+            if is_numeric_event:
+                pass
+            elif is_mousemove and is_numeric_edit:
+                pass
+            elif not state.interactive:
+                return self._handle_pass_through(context, event)
+            elif not is_mousemove:
+                return self._handle_pass_through(context, event)
+
+        # TODO: Disable numeric input when no state.property
+        if is_numeric_event:
+            self._numeric.evaluate_event(event)
+            self.set_status_text(context)
+
+        return self.evaluate_state(context, event, event_triggered)
+
+    # -------------------------------------------------------------------------
+    # evaluate_state and its sub-steps
+    # -------------------------------------------------------------------------
+
+    def _get_state_values(self, context: Context, state, coords):
+        """Call the state's state_func and return the raw position/value, or None."""
+        cb = self.get_func(state, "state_func")
+        if not cb:
+            return None
+        return cb(context, coords)
+
+    def _pick_hovered(self, context: Context, coords, state, is_numeric):
+        """Try to pick an existing element under the cursor.
+
+        Returns ``(is_picked, pointer_values)`` — pointer_values only valid when
+        is_picked is True.
+        """
+        if is_numeric or not state.pointer:
+            return False, None
+        pick = self.get_func(state, "pick_element")
+        retval = pick(context, coords)
+        if retval is not None:
+            return True, to_list(retval)
+        return False, None
+
+    def _resolve_values(self, context: Context, coords, state, is_numeric, is_picked):
+        """Compute property values via state_func or numeric input.
+
+        Returns ``(values, ok)`` — ok indicates the state can advance.
+        Sets properties on self and marks ``_undo`` when values are produced.
+        """
+        ok = False
+        values = []
+        use_create = state.use_create and self.has_func(state, "create_element")
+        if not use_create or is_picked:
+            return values, ok
+
+        if is_numeric:
+            values = [self.get_numeric_value(context, coords)]
+        else:
+            values = to_list(self._get_state_values(context, state, coords))
+
+        if values:
+            props = self.get_property()
+            if props:
+                for i, v in enumerate(values):
+                    setattr(self, props[i], v)
+                self._undo = True
+                ok = not state.pointer
+
+        return values, ok
+
+    def _apply_undo(self, context: Context):
+        """Restore to snapshot or Blender undo, then replay redo_states."""
+        if self._state_snapshot is not None:
+            self.restore_snapshot(context, self._state_snapshot)
+            self.on_before_redo_states(context)
+            self.redo_states(context)
+        else:
+            bpy.ops.ed.undo_push(message="Redo: " + self.bl_label)
+            bpy.ops.ed.undo()
+            self.on_before_redo_states(context)
+            self.redo_states(context)
+        self._undo = False
+
+    def evaluate_state(self, context: Context, event, triggered):
+        state = self.state
+        data = self.state_data
+        is_numeric = self._numeric.is_active
+        coords = Vector((event.mouse_region_x, event.mouse_region_y))
+
+        if self.state_init_coords is None:
+            self.state_init_coords = coords
+
+        is_picked, pointer_values = self._pick_hovered(
+            context, coords, state, is_numeric
+        )
+        values, ok = self._resolve_values(context, coords, state, is_numeric, is_picked)
+
+        # Reflect the live value (property or point placement) in the status bar
+        # and beside the geometry it belongs to. A typed number resolves into
+        # these values too, so the dimensions follow the geometry onto what was
+        # typed instead of staying where the mouse last put it.
+        self._status_origin = self.state_value_origin(context)
+        self._status_values = tuple(values or ())
+        self._status_value = self._format_values(values) if values else None
+        self.set_status_text(context)
+
+        # Resolve state pointer
+        if state.pointer:
+            if is_picked:
+                data["is_existing_entity"] = True
+                self.set_state_pointer(pointer_values, implicit=True)
+                ok = True
+            elif values:
+                # pointer will be filled during redo_states via create_element
+                data["is_existing_entity"] = False
+                ok = True
+
+        # A confirming event always rebuilds, so what gets committed never
+        # depends on whether the preview was updated in place.
+        preview_key = None if triggered else self.get_preview_key(context)
+
+        # One live update: roll back the previous preview, then rebuild it. Both
+        # halves recreate curves, so they share one batch (see batched_changes).
+        with self.batched_changes(context):
+            succeede = False
+            if (
+                preview_key is not None
+                and preview_key == self._preview_key
+                and self.update_preview(context)
+                # After the update: the hover pick clears a created pointer until
+                # its element is recreated or updated.
+                and self.check_props()
+            ):
+                succeede = True
+            else:
+                if self._undo:
+                    self._apply_undo(context)
+                if self.check_props():
+                    succeede = self.run_op(context)
+                    self._undo = True
+            self._preview_key = preview_key if succeede else None
+
+        # State transition
+        if triggered and ok:
+            if not self.next_state(context):
+                if self.check_continuous_draw():
+                    self.do_continuous_draw(context)
+                else:
+                    return self._end(context, succeede)
+            if is_numeric:
+                # Run next state once immediately so geometry updates without a mousemove
+                self.evaluate_state(context, event, False)
+
+        context.area.tag_redraw()
+
+        if triggered and not ok:
+            # An optional state whose overall requirements are already met can be
+            # skipped rather than cancelled: advance to the next state (e.g. the
+            # dimension tool leaving its optional "second entity" pick to fall
+            # through to label placement), or finish if it was the last one.
+            if state.optional and self.check_props():
+                if not self.next_state(context):
+                    return self._end(context, succeede)
+                return {"RUNNING_MODAL"}
+            # Triggered on non-valid target — cancel to avoid confusion
+            return self._end(context, False)
+
+        if triggered or is_numeric:
+            return {"RUNNING_MODAL"}
+        return self._handle_pass_through(context, event)
+
+    # -------------------------------------------------------------------------
+    # Operator execution helpers
+    # -------------------------------------------------------------------------
+
+    def batched_changes(self, context: Context):
+        """Context manager around one live update (undo restore plus ``main``).
+
+        A live update runs on every mouse move and may create or edit many
+        elements. The default does nothing; operators whose elements carry
+        whole-sketch bookkeeping override it to do that bookkeeping once per
+        update instead of once per element.
+        """
+        return nullcontext()
+
+    def preview_structure(self, context: Context) -> Any:
+        """Hook: what, besides the pointers, decides the preview's structure.
+
+        Return None when the current preview can't be updated in place. The
+        default does, since only opted in operators (``preview_in_place``) ask.
+        """
+        return None
+
+    def update_preview(self, context: Context) -> bool:
+        """Hook: move the current preview to the latest input without rebuilding.
+
+        Only called when the preview's structure is unchanged since the last
+        update (same state, same picks, same ``preview_structure``), so the
+        elements it created still exist and only their positions are stale.
+        Return False to fall back to the full undo and rebuild, which also
+        repairs anything a partial update left behind.
+        """
+        return False
+
+    def get_preview_key(self, context: Context) -> Any:
+        """The structure of the preview an update would produce, or None.
+
+        Rebuilding the preview on every move removes and recreates every element
+        of every state. When nothing but the current value changed, the same
+        elements would be recreated in new positions, which an operator can do
+        by moving them instead (see ``update_preview``).
+        """
+        if not self.preview_in_place or self._numeric.is_active:
+            return None
+        structure = self.preview_structure(context)
+        if structure is None:
+            return None
+        pointers = []
+        for i, state in enumerate(self.get_states()):
+            if i > self.state_index:
+                break
+            if not state.pointer:
+                continue
+            data = self._state_data.get(i, {})
+            existing = bool(data.get("is_existing_entity", False))
+            # A created element is recreated from values; a picked one is part of
+            # the structure.
+            picked = (
+                to_list(self.get_state_pointer(index=i, implicit=True))
+                if existing
+                else None
+            )
+            pointers.append((existing, picked))
+        return (self.state_index, tuple(map(str, pointers)), structure)
+
+    def run_op(self, context: Context):
+        if not hasattr(self, "main"):
+            raise NotImplementedError(
+                "StatefulOperators need to have a main method defined!"
+            )
+        # Capture the picked pointers so a later redo (fresh instance) can
+        # rebuild them; this runs on every live update, keeping it current.
+        self._store_pointers()
+        retval = self._run_main(context)
+        self.executed = True
+        return retval
+
+    # -------------------------------------------------------------------------
+    # Pointer persistence (survives the redo/execute path)
+    # -------------------------------------------------------------------------
+    #
+    # Each pointer state's identity is stored in hidden, per-state real
+    # properties (registered by register_properties): ``ptr{i}_kind`` (the
+    # picked type's __name__), ``ptr{i}_existing`` (is_existing_entity), and the
+    # implicit value split into a string slot ``ptr{i}_name`` + int slot
+    # ``ptr{i}_index``. Blender persists these across the redo/execute path (a
+    # fresh instance), where the transient _state_data is gone.
+
+    def _pointer_type_registry(self):
+        """Map a pointer type's ``__name__`` back to the class, for redo restore.
+
+        Base is empty; the integration layer adds native Blender types and the
+        extension layer adds its entity/curve-ref types.
+        """
+        return {}
+
+    @staticmethod
+    def _pack_pointer_vals(vals):
+        """Split implicit pointer values into a (name, index) pair for storage.
+
+        Implicit values are at most one string id (object name / curve_id) and
+        one int (mesh element index / entity index); -1 marks "no int".
+        """
+        name, index = "", -1
+        for v in vals:
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, str):
+                name = v
+            elif isinstance(v, int):
+                index = v
+        return name, index
+
+    @staticmethod
+    def _unpack_pointer_vals(name, index):
+        """Rebuild the implicit value list from the stored (name, index) slots.
+
+        The filled slots imply the shape: name+index -> mesh element [name,
+        index]; name only -> object / curve-ref [name]; index only -> entity
+        [index]. Returns None when neither slot is set.
+        """
+        if name and index >= 0:
+            return [name, index]
+        if name:
+            return [name]
+        if index >= 0:
+            return [index]
+        return None
+
+    def _capture_props(self) -> dict:
+        """The operator's own properties as they stand, to restore later."""
+        values = {}
+        names = getattr(self, "_declared_prop_names", None)
+        for name in names() if names else ():
+            if name.startswith("_") or name in ("edit_state", "edit_clear"):
+                continue
+            try:
+                value = getattr(self, name)
+            except (AttributeError, TypeError):
+                continue
+            if hasattr(value, "__len__") and not isinstance(value, str):
+                value = tuple(value)
+            values[name] = value
+        return values
+
+    def _apply_props(self, values: dict) -> None:
+        """Put back what ``_capture_props`` took."""
+        for name, value in (values or {}).items():
+            try:
+                setattr(self, name, value)
+            except (AttributeError, TypeError):
+                pass
+
+    def _store_pointers(self):
+        """Write each resolved pointer state's identity to its hidden props."""
+        for i, state in enumerate(self.get_states()):
+            if not state.pointer:
+                continue
+            data = self._state_data.get(i)
+            kind, existing, name, index = "", False, "", -1
+            if data and data.get("type"):
+                kind = data["type"].__name__
+                existing = bool(data.get("is_existing_entity", False))
+                name, index = self._pack_pointer_vals(
+                    to_list(self.get_state_pointer(index=i, implicit=True))
+                )
+            # Guarded: duplicate-registration phantoms lack the RNA properties.
+            try:
+                setattr(self, "ptr%d_kind" % i, kind)
+                setattr(self, "ptr%d_existing" % i, existing)
+                setattr(self, "ptr%d_name" % i, name)
+                setattr(self, "ptr%d_index" % i, index)
+            except AttributeError:
+                pass
+
+    def _restore_pointers(self):
+        """Rebuild pointer state data from the hidden props (redo/execute path).
+
+        Only for the fresh-instance execute/redo/edit path (``_state_snapshot is
+        None``). During the interactive modal a snapshot is held and _state_data
+        is resolved live every frame; restoring there would re-inject the last
+        *picked* identity (kind + is_existing_entity) and clobber a subsequent
+        free placement -- e.g. hover a point then move to empty and the endpoint
+        stays stuck on the point. The per-state ``data.get("type")`` guard below
+        is not enough on its own: pick_element nulls ``type`` when hovering empty,
+        which re-opens the door for the stale restore.
+        """
+        if self._state_snapshot is not None:
+            return
+        self._invalid_pointers = []
+        registry = self._pointer_type_registry()
+        for i, state in enumerate(self.get_states()):
+            if not state.pointer:
+                continue
+            data = self.get_state_data(i)
+            if data.get("type"):
+                continue
+            kind = getattr(self, "ptr%d_kind" % i, "")
+            if not kind:
+                continue
+            ptype = registry.get(kind)
+            if ptype is None:
+                continue
+            data["type"] = ptype
+            data["is_existing_entity"] = bool(
+                getattr(self, "ptr%d_existing" % i, False)
+            )
+            vals = self._unpack_pointer_vals(
+                getattr(self, "ptr%d_name" % i, ""),
+                getattr(self, "ptr%d_index" % i, -1),
+            )
+            if vals is not None:
+                self.set_state_pointer(vals, index=i, implicit=True)
+                if not self._restored_pointer_ok(i, state):
+                    self._invalid_pointers.append(state.name)
+
+    def _restored_pointer_ok(self, index, state):
+        """Hook: whether a pointer rebuilt from props fits its state's types."""
+        return True
+
+    def redo_states(self, context: Context):
+        """Recreate non-persistent elements for states up to the current one."""
+        # The redo/execute path runs on a fresh instance with empty _state_data;
+        # rebuild the picked pointers from the persisted identity first.
+        self._restore_pointers()
+
+        for i, state in enumerate(self.get_states()):
+            if i > self.state_index:
+                # TODO: don't depend on active state; ideally going back is possible
+                break
+            if state.pointer:
+                data = self._state_data.get(i, {})
+                is_existing_entity = data.get("is_existing_entity", True)
+                props = self.get_property(index=i)
+                if props and not is_existing_entity:
+                    create = self.get_func(state, "create_element")
+                    ret_values = create(
+                        context, [getattr(self, p) for p in props], state, data
+                    )
+                    self.set_state_pointer(to_list(ret_values), index=i, implicit=True)
+
+    def _end(self, context, succeede, skip_undo=False, keep_stateful_running=False):
+        context.window.cursor_modal_restore()
+        self._run_fini(context, succeede)
+        # One-off tools return to their select tool once done (only on success,
+        # so a missed pick keeps the tool for a retry). The target tool differs
+        # per operator: object tools -> Blender's select, sketch tools -> the
+        # sketch select tool.
+        if succeede and self.return_to_tool:
+            try:
+                bpy.ops.wm.tool_set_by_id(name=self.return_to_tool)
+            except Exception:
+                pass
+        self.on_before_redo_states(context)
+        context.workspace.status_text_set(None)
+        global_data.state_value = None
+
+        if not keep_stateful_running:
+            global_data.stateful_op_running = False
+            # Gizmo bookkeeping is deferred while an operator runs; refresh now so
+            # hit-testing and colors are current immediately after it ends.
+            from ..utilities.view import refresh
+
+            refresh(context)
+
+        # Stop publishing pick types so hover falls back to the idle default.
+        global_data.hover_types = None
+        global_data.hover_element = None
+
+        if not succeede and not skip_undo:
+            if self._state_snapshot is not None:
+                self.restore_snapshot(context, self._state_snapshot)
+            else:
+                bpy.ops.ed.undo_push(message="Cancelled: " + self.bl_label)
+                bpy.ops.ed.undo()
+        elif succeede:
+            # Record what this commit created (modal path; the execute/edit path
+            # records in _run_main). Enables idempotent re-apply on re-pick.
+            self._record_committed_output(context)
+
+        self._state_snapshot = None
+        if succeede:
+            return {"FINISHED"}
+        if not self._chain_committed:
+            return {"CANCELLED"}
+        # Ending a continuous chain cancels only the segment in progress: what
+        # the chain already committed stands, so report FINISHED. Blender
+        # registers finished operators only, and without it the segments just
+        # drawn would have no "Adjust Last Operation" panel at all. The panel
+        # adjusts the last committed segment, so the props describe that one
+        # again rather than the segment just abandoned.
+        self._apply_props(self._committed_props)
+        return {"FINISHED"}
+
+    # -------------------------------------------------------------------------
+    # Continuous draw
+    # -------------------------------------------------------------------------
+
+    def check_continuous_draw(self):
+        if self.continuous_draw:
+            if not hasattr(self, "continue_draw") or self.continue_draw():
+                return True
+        return False
+
+    def _reset_op(self):
+        self.executed = False
+        for i, s in enumerate(self.get_states()):
+            if not s.pointer:
+                continue
+            self.set_state_pointer(None, index=i)
+        self._state_data.clear()
+        self._numeric = NumericInput()
+        self._state_snapshot = None
+        self._preview_key = None
+
+    def chain_scope(self, context: Context) -> str:
+        """Where this operator draws, so a chain point stays where it belongs.
+
+        Handed over with the chain point and compared before it is taken up (see
+        utilities.continuation). Default: one nameless scope.
+        """
+        return ""
+
+    def chain_point_valid(self, context: Context) -> bool:
+        """Whether the seeded first state actually resolves to something."""
+        return True
+
+    def _seed_chain_point(self, context: Context, values, kind):
+        """Make ``values`` the first state's value and stand at the next state.
+
+        How a chain carries on: the point the previous segment ended at is the
+        point the new one starts from, the same entity rather than a second one
+        on top of it, so the two are really connected.
+        """
+        data = self.get_state_data(0)
+        data["is_existing_entity"] = True
+        if kind:
+            data["type"] = kind
+        self.set_state_pointer(values, index=0, implicit=True)
+        self.set_state(context, 1)
+
+    def _offer_chain(self, context: Context):
+        """Hand the chain's last point to whichever tool starts next.
+
+        Only from a chain that has committed something: the segment in progress
+        is rolled back when this run ends, so the points it placed itself do not
+        survive to be carried on from.
+        """
+        if not self._chain_committed:
+            return
+        data = self._state_data.get(0, {})
+        if not data.get("is_existing_entity", False):
+            return
+        values = to_list(self.get_state_pointer(index=0, implicit=True))
+        if not values:
+            return
+        continuation.publish(values, data.get("type"), self.chain_scope(context))
+
+    def _seed_from_chain(self, context: Context) -> bool:
+        """Carry on from the point the tool switched away from had reached.
+
+        The offer is consumed whether or not it is taken up, so it never leaks
+        into a run that has nothing to do with that chain.
+        """
+        offer = continuation.take(self.chain_scope(context))
+        if offer is None or not self.accepts_chain:
+            return False
+
+        values, kind = offer
+        states = self.get_states()
+        if len(states) < 2 or not states[0].pointer:
+            return False
+
+        # Whether the point fits is not decided by the state's declared types --
+        # a pick stores the type it resolved to, which is not one of them -- but
+        # by whether it resolves at all, below.
+        self._seed_chain_point(context, values, kind)
+        if not self.chain_point_valid(context):
+            # Gone since it was offered (an undo, say): start from scratch.
+            self._reset_op()
+            self.set_state(context, 0)
+            return False
+        return True
+
+    def _take_last_state_pointer(self):
+        """Return (last_index, implicit_values, type_metadata) for the last pointer state."""
+        for i, s in reversed(list(enumerate(self.get_states()))):
+            if not s.pointer:
+                continue
+            last_type = self._state_data.get(i, {}).get("type")
+            values = to_list(self.get_state_pointer(index=i, implicit=True))
+            return i, values, last_type
+        return None, [], None
+
+    def do_continuous_draw(self, context):
+        """Finish the current segment and immediately start the next one.
+
+        The last pointer of the finished segment (e.g. a line endpoint)
+        becomes the first pointer of the new segment, creating a chain.
+        """
+        self._end(context, True, keep_stateful_running=True)
+        bpy.ops.ed.undo_push(message=self.bl_label)
+        # What this run committed survives the chain being cancelled (see _end),
+        # and the redo panel has to adjust that segment, not the aborted one the
+        # props describe by the time the chain ends.
+        self._chain_committed = True
+        self._committed_props = self._capture_props()
+
+        # Save the endpoint before _reset_op wipes state
+        last_index, values, last_type = self._take_last_state_pointer()
+
+        self._reset_op()
+        # The next segment's output is what gets created from here on.
+        self._capture_baseline(context)
+
+        # Re-inject the saved endpoint as the seed for the new segment
+        self._seed_chain_point(context, values, last_type)
+        self._state_snapshot = self.create_snapshot(context)
+
+    # -------------------------------------------------------------------------
+    # Class-level description
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def description(cls, context, _properties):
+        states = [
+            state_desc(s.name, s.description, s.types)
+            for s in cls.get_states_definition()
+        ]
+        descs = []
+        hint = get_key_map_desc(context, cls.bl_idname)
+        if hint:
+            descs.append(hint)
+        if cls.__doc__:
+            descs.append(cls.__doc__)
+        return stateful_op_desc(" ".join(descs), *states)

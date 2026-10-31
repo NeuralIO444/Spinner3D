@@ -1,0 +1,1826 @@
+import math
+
+import bpy
+from bpy.props import (
+    BoolProperty,
+    CollectionProperty,
+    EnumProperty,
+    FloatProperty,
+    FloatVectorProperty,
+    IntProperty,
+    StringProperty,
+)
+from bpy.types import (
+    Context,
+    Event,
+    MeshEdge,
+    Object,
+    Operator,
+    PropertyGroup,
+)
+from mathutils import Vector
+from mathutils.geometry import intersect_line_line, intersect_line_plane
+
+from ..declarations import BLENDER_SELECT_TOOL, Operators
+from ..stateful_operator.state import state_from_args
+from ..stateful_operator.utilities.register import register_stateops_factory
+from ..utilities.boolean_nodes import SOLVER_ITEMS, SOLVER_SOCKET
+from ..utilities.view import get_picking_origin_dir, get_placement_pos
+from .base_3d import Operator3d
+
+
+def copy_modifier(source, target):
+    """Recreate ``source`` on ``target``, of whatever type, settings and all.
+
+    Blender's own copy goes through an operator and a selection, which is no use
+    from a migration pass. A Geometry Nodes modifier keeps its group and the
+    values of its inputs; any other keeps its own properties.
+    """
+    copy = target.modifiers.new(source.name, source.type)
+    for prop in source.bl_rna.properties:
+        if prop.is_readonly or prop.identifier in {"name", "type"}:
+            continue
+        try:
+            setattr(copy, prop.identifier, getattr(source, prop.identifier))
+        except (AttributeError, TypeError):
+            continue  # a property this modifier does not really own
+
+    group = getattr(source, "node_group", None)
+    if source.type == "NODES" and group is not None:
+        for socket in group.interface.items_tree:
+            if getattr(socket, "in_out", "") != "INPUT":
+                continue
+            if getattr(socket, "socket_type", "") == "NodeSocketGeometry":
+                continue  # carries no value: it is what the stack is fed
+            try:
+                value = get_modifier_input(source, socket.identifier)
+            except (AttributeError, KeyError):
+                continue
+            if value is not None:
+                set_modifier_input(copy, socket.identifier, value)
+    return copy
+
+
+def set_modifier_input(modifier, identifier, value):
+    """Set a Geometry-Nodes modifier input by socket identifier.
+
+    Blender <= 5.1 stores modifier inputs as ID-properties on the modifier
+    itself (``modifier["Input_2"] = value``). Blender 5.2 dropped ID-property
+    support from the modifier and exposes inputs through an RNA interface at
+    ``modifier.properties.inputs.<identifier>.value`` instead; the old access
+    now raises "id properties not supported for this type". Note attribute
+    access on ``.inputs`` returns the typed wrapper with a writable ``value``,
+    whereas subscripting it returns the raw ID-property group (no ``value``).
+    """
+    props = getattr(modifier, "properties", None)
+    if props is not None and hasattr(props, "inputs"):
+        getattr(props.inputs, identifier).value = value  # Blender 5.2+
+    else:
+        modifier[identifier] = value  # Blender <= 5.1
+
+
+def get_modifier_input(modifier, identifier):
+    """Read a Geometry-Nodes modifier input by socket identifier.
+
+    Version-aware counterpart to ``set_modifier_input`` (see it for the 5.1 vs
+    5.2 access split).
+    """
+    props = getattr(modifier, "properties", None)
+    if props is not None and hasattr(props, "inputs"):
+        return getattr(props.inputs, identifier).value  # Blender 5.2+
+    return modifier[identifier]  # Blender <= 5.1
+
+
+def draw_modifier_input(layout, modifier, identifier, text=""):
+    """Draw one Geometry-Nodes modifier input as an editable field.
+
+    Version-aware like ``set_modifier_input``: on Blender 5.2+ the value lives at
+    ``modifier.properties.inputs.<identifier>.value``, and the old
+    ``modifier["Input_2"]`` data path does not merely fail there, it draws
+    nothing at all.
+    """
+    props = getattr(modifier, "properties", None)
+    if props is not None and hasattr(props, "inputs"):
+        socket = getattr(props.inputs, identifier, None)
+        if socket is None:
+            return False
+        layout.prop(socket, "value", text=text)  # Blender 5.2+
+        return True
+    # Blender <= 5.1: inputs are ID-properties. ``layout.prop`` on a missing
+    # key silently draws nothing (no error row, no warning), so check first.
+    if identifier not in modifier.keys():
+        return False
+    layout.prop(modifier, f'["{identifier}"]', text=text)
+    return True
+
+
+# Boolean operations, in the node group's Index Switch order: the operator's
+# enum name maps to this integer index (see set/get_boolean_operation).
+BOOLEAN_OPERATIONS = ("Difference", "Union", "Intersect")
+
+
+def set_boolean_solver(modifier, identifier, name):
+    """Set the Boolean Solver input (an integer index into SOLVERS)."""
+    from ..utilities.boolean_nodes import SOLVERS
+
+    set_modifier_input(modifier, identifier, SOLVERS.index(name))
+
+
+def get_boolean_solver(modifier, identifier):
+    """Read the Boolean Solver input back as its name."""
+    from ..utilities.boolean_nodes import SOLVERS
+
+    index = int(get_modifier_input(modifier, identifier))
+    if 0 <= index < len(SOLVERS):
+        return SOLVERS[index]
+    return SOLVERS[0]
+
+
+def default_boolean_solver():
+    """The preferred solver for new booleans, falling back to Exact."""
+    try:
+        from ..utilities.preferences import get_prefs
+
+        return get_prefs().boolean_solver
+    except (AttributeError, KeyError):  # preferences unavailable
+        return "Exact"
+
+
+def set_boolean_operation(modifier, identifier, name):
+    """Set the boolean Operation input (an integer index into BOOLEAN_OPERATIONS)."""
+    set_modifier_input(modifier, identifier, BOOLEAN_OPERATIONS.index(name))
+
+
+def get_boolean_operation(modifier, identifier):
+    """Read the boolean Operation input back as its name."""
+    index = int(get_modifier_input(modifier, identifier))
+    if 0 <= index < len(BOOLEAN_OPERATIONS):
+        return BOOLEAN_OPERATIONS[index]
+    return BOOLEAN_OPERATIONS[0]
+
+
+def boolean_modifier_name(cutter):
+    """Name of the boolean modifier that cuts ``cutter`` on a body.
+
+    One modifier per cutter, so several booleans stack on the same body instead
+    of overwriting each other.
+    """
+    return f"CAD_Sketcher Boolean {cutter.name}"
+
+
+# Socket identifiers per node group, by name. Walking the interface is not free
+# and nothing about it changes while the group does not, yet this is asked once
+# per modifier per candidate body -- dozens of times in a single mouse move.
+_input_ids_cache = {}
+
+
+def boolean_input_ids(node_group):
+    """Map ``{socket name: identifier}`` for the boolean group's inputs."""
+    key = node_group.name
+    size = len(node_group.interface.items_tree)
+    cached = _input_ids_cache.get(key)
+    if cached is not None and cached[0] == size:
+        return cached[1]
+
+    ids = {
+        s.name: s.identifier
+        for s in node_group.interface.items_tree
+        if getattr(s, "in_out", "") == "INPUT"
+    }
+    _input_ids_cache[key] = (size, ids)
+    return ids
+
+
+def boolean_cutters(obj):
+    """Objects ``obj`` reads as cutters through its CAD Sketcher booleans."""
+    from ..utilities.boolean_nodes import BOOLEAN_NODE_GROUP
+
+    cutters = []
+    for m in obj.modifiers:
+        group = getattr(m, "node_group", None)
+        if m.type != "NODES" or group is None or group.name != BOOLEAN_NODE_GROUP:
+            continue
+        # A linked group keeps the interface it was built with, so the socket
+        # may not be there at all; reading it is not worth an exception in a
+        # handler-driven path.
+        cutter_id = boolean_input_ids(group).get("Cutter")
+        if cutter_id is None:
+            continue
+        cutter = get_modifier_input(m, cutter_id)
+        if cutter is not None:
+            cutters.append(cutter)
+    return cutters
+
+
+def creates_boolean_cycle(body, cutter):
+    """Whether making ``body`` read ``cutter`` closes a boolean dependency cycle.
+
+    True when ``cutter`` already depends (transitively) on ``body`` through other
+    CAD Sketcher booleans, including ``cutter is body`` (a length-0 cycle). Adding
+    such a modifier would close a depsgraph cycle, which crashes Blender.
+    """
+    stack = [cutter]
+    seen = set()
+    while stack:
+        obj = stack.pop()
+        if obj == body:
+            return True
+        if obj in seen:
+            continue
+        seen.add(obj)
+        stack.extend(boolean_cutters(obj))
+    return False
+
+
+def apply_boolean(
+    body,
+    cutter,
+    operation="Difference",
+    self_intersection=False,
+    hole_tolerant=False,
+    solver=None,
+    depsgraph=None,
+):
+    """Add or update a nondestructive boolean of ``cutter`` on ``body``.
+
+    Reuses the per-cutter modifier if it already exists (so re-applying edits it),
+    otherwise creates one. Returns the modifier, or None if the link would create
+    a dependency cycle. ``body`` and ``cutter`` must be original (not evaluated)
+    objects. The shared entry point for the Boolean tool and for the extrude /
+    revolve tools that boolean their result directly. ``solver`` defaults to the
+    Boolean Solver preference.
+
+    ``self_intersection`` is off by default: it costs about five times the
+    evaluation on the Exact solver and only matters for input that intersects
+    itself. Pass ``depsgraph`` to decide the solver against an evaluation the
+    caller already has, rather than forcing another one.
+    """
+    from ..utilities.boolean_nodes import build_boolean_node_group
+
+    if creates_boolean_cycle(body, cutter):
+        return None
+
+    ng = build_boolean_node_group()
+    name = boolean_modifier_name(cutter)
+    mod = body.modifiers.get(name)
+    if mod is None:
+        mod = body.modifiers.new(name, "NODES")
+    mod.node_group = ng
+
+    ids = boolean_input_ids(ng)
+    set_modifier_input(mod, ids["Cutter"], cutter)
+    set_boolean_operation(mod, ids["Operation"], operation)
+    set_modifier_input(mod, ids["Self Intersection"], self_intersection)
+    set_modifier_input(mod, ids["Hole Tolerant"], hole_tolerant)
+    set_boolean_solver(
+        mod, ids[SOLVER_SOCKET], _solver_for(body, cutter, solver, depsgraph)
+    )
+    return mod
+
+
+def _solver_for(body, cutter, solver=None, depsgraph=None):
+    """The boolean solver to use, honouring the choice unless it would delete.
+
+    Manifold is the fast solver, but it drops an operand that is not a closed
+    volume: cutting a flat profile with it leaves nothing at all instead of a
+    profile with a hole. Exact handles that, so an open operand forces it. The
+    modifier keeps the solver as an input, so it can still be changed by hand.
+
+    ``evaluated_depsgraph_get`` re-evaluates the scene when anything has been
+    written since the last one, so a caller applying several booleans in a row
+    should pass the depsgraph it already took: the operands' shape is what is
+    being asked about, and that is not what those writes changed.
+    """
+    from ..utilities.boolean_targets import is_closed_solid
+
+    chosen = solver or default_boolean_solver()
+    if chosen != "Manifold":
+        return chosen
+
+    if depsgraph is None:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    if all(is_closed_solid(obj, depsgraph) for obj in (body, cutter)):
+        return chosen
+    return "Exact"
+
+
+def select_result(context, cutter):
+    """Leave the thing the tool just made selected.
+
+    What that is depends on where the solid went: a cut joins the part it cuts,
+    and the part is what now shows the result, so that is what to hold on to. A
+    standalone solid is its own result. Never the cutter itself, which a cut
+    hides -- the user would be left holding something they cannot see.
+    """
+    from ..utilities.part import part_root_of
+
+    result = part_root_of(cutter) or cutter
+    if result.name not in context.view_layer.objects:
+        return
+    for obj in context.selected_objects:
+        obj.select_set(False)
+    result.select_set(True)
+    context.view_layer.objects.active = result
+
+
+class BooleanTargetItem(PropertyGroup):
+    """One auto-detected boolean target, toggled in the extrude/revolve redo panel."""
+
+    name: StringProperty()
+    enabled: BoolProperty(name="Enabled", default=True)
+
+
+# Redo-panel enum for the tool boolean. "None" leaves the tool a plain solid.
+BOOLEAN_TOOL_OPERATIONS = (
+    ("None", "None", "Do not boolean; just build the solid"),
+    ("Difference", "Difference", "Subtract the solid from the targets"),
+    ("Union", "Union", "Merge the solid into the targets"),
+    ("Intersect", "Intersect", "Keep only the overlap with the targets"),
+)
+
+
+class BooleanFromToolMixin:
+    """Boolean an extrude/revolve solid into auto-detected targets.
+
+    Mixed into the extrude and revolve operators. The concrete operator declares
+    the three properties below (so they register on that operator) and calls
+    ``reset_booleans`` from ``init``, ``finish_booleans`` from ``fini`` and
+    ``draw_boolean_settings`` from ``draw_settings``:
+
+        operation: EnumProperty(items=BOOLEAN_TOOL_OPERATIONS, default="Difference")
+        boolean_targets: CollectionProperty(type=BooleanTargetItem)
+        boolean_detected: BoolProperty(default=False, options={"HIDDEN"})
+    """
+
+    def reset_booleans(self):
+        """Clear boolean state for a fresh interactive run (call from init).
+
+        init runs on invoke but not on the redo re-execute, so clearing here lets
+        a new invocation start clean while the redo panel keeps the user's edits
+        (their per-target toggles and operation override) across re-runs.
+        """
+        self.boolean_detected = False
+        self.boolean_targets.clear()
+
+    def _boolean_offset(self):
+        # Extrude orients the default mode by its offset sign; revolve has none.
+        return getattr(self, "offset", 0.0)
+
+    def finish_booleans(self, context):
+        """Re-detect targets, then apply/remove the per-target booleans.
+
+        The cutter is this tool's own object: its evaluated solid is read by the
+        boolean group through Object Info. Detection re-runs on every execute (so a
+        redo that lengthens the extrude picks up bodies it now reaches), but the
+        user's per-target toggles are carried over, and the default operation is
+        seeded only on the first run so a manual override sticks.
+        """
+        cutter = getattr(self, "_obj", None) or self.resolved_object()
+        if cutter is None:
+            return
+        cutter = cutter.original
+
+        from ..model.sketch_ref import Sketch
+
+        # The tool works on the body; its sketch is what carries provenance (what
+        # it was drawn on), so resolve back to it.
+        from ..utilities.body import is_body, sketch_of
+        from ..utilities.boolean_targets import (
+            default_operation,
+            detect_targets,
+            sketch_source_body,
+        )
+
+        if cutter.type == "CURVES":
+            sketch = Sketch(cutter)
+        elif is_body(cutter) and sketch_of(cutter) is not None:
+            sketch = Sketch(sketch_of(cutter))
+        else:
+            sketch = None
+
+        auto = context.scene.sketcher.use_auto_boolean
+        if not self.boolean_detected and not auto:
+            # Auto boolean is off: leave the new solid standalone. The user can
+            # still pick an operation in the redo panel to boolean on demand.
+            self.operation = "None"
+            self.boolean_detected = True
+
+        # The solid must be evaluated before the overlap test can see it. Look for
+        # targets while the operation is still undecided too: what a solid reaches
+        # is what decides whether it is a cut at all.
+        undecided = not self.boolean_detected and auto
+        depsgraph = None
+        if self.operation != "None" or undecided:
+            # One evaluation for the whole pass: detection needs the solid
+            # evaluated, and the per-target solver check asks about the same
+            # shapes. Taking a fresh depsgraph after the first target's modifier
+            # is written would re-evaluate every boolean on the body again --
+            # twice the work of a mouse move, and that work is the expensive part.
+            context.view_layer.update()
+            depsgraph = context.evaluated_depsgraph_get()
+            targets = detect_targets(context, cutter, sketch, depsgraph)
+        else:
+            targets = []
+
+        if undecided:
+            if targets:
+                # Push/pull: outward from the face you sketched on adds material,
+                # into it removes material.
+                has_source = (
+                    sketch is not None and sketch_source_body(sketch) is not None
+                )
+                self.operation = default_operation(self._boolean_offset(), has_source)
+                self.boolean_detected = True
+            else:
+                # It reaches nothing, so it is not a cut: a solid standing on its
+                # own. Left undecided, so a longer extrude that does reach a body
+                # still gets a sensible default rather than being stuck at None.
+                self.operation = "None"
+                targets = []
+
+        # Preserve exclusions across redo while adding newly-overlapping bodies; a
+        # target that drops out of detection loses its (now moot) boolean anyway.
+        prev_enabled = {item.name: item.enabled for item in self.boolean_targets}
+        self.boolean_targets.clear()
+        for obj in targets:
+            item = self.boolean_targets.add()
+            item.name = obj.name
+            item.enabled = prev_enabled.get(obj.name, True)
+
+        enabled_bodies = self._apply_boolean_targets(cutter, depsgraph)
+
+        # Making a sketch solid is what settles which part it belongs to: a cut
+        # joins the part it cuts, a standalone solid roots one. A mesh cutter that
+        # is not a sketch's body is left alone: a part with its own history stays
+        # a part.
+        if sketch is not None:
+            from ..utilities.part import settle_membership
+
+            # Passing the context lets a part being born take its base planes
+            # here, which is what the joining body's own plane merges onto.
+            settle_membership(cutter, enabled_bodies, context)
+
+        from ..utilities.part import update_cutter_display
+
+        update_cutter_display(cutter, enabled_bodies, self.operation != "None")
+
+        # Membership (and with it the collection layout) follows the hierarchy,
+        # which settle_membership has just updated; the sync picks it up.
+        from ..utilities.collections import sync_part_collections
+
+        sync_part_collections(context.scene)
+        select_result(context, cutter)
+
+    def _apply_boolean_targets(self, cutter, depsgraph=None):
+        """Apply this cutter's booleans. Returns the bodies it feeds, in order."""
+        name = boolean_modifier_name(cutter)
+        enabled_bodies = []
+        for item in self.boolean_targets:
+            body = bpy.data.objects.get(item.name)
+            if body is None:
+                continue
+            if self.operation != "None" and item.enabled:
+                apply_boolean(body, cutter, self.operation, depsgraph=depsgraph)
+                enabled_bodies.append(body)
+        # Strip this cutter's boolean from every other body, so excluding a target,
+        # setting the operation to None, or a shorter extrude no longer reaching a
+        # body all remove its (now stale) boolean -- even if it left the list.
+        for body in bpy.data.objects:
+            if body in enabled_bodies:
+                continue
+            mod = body.modifiers.get(name)
+            if mod is not None:
+                body.modifiers.remove(mod)
+        return enabled_bodies
+
+    def draw_boolean_settings(self, layout):
+        layout.separator()
+        layout.prop(self, "operation", text="Boolean")
+        if self.operation != "None" and len(self.boolean_targets):
+            box = layout.box()
+            box.label(text="Targets")
+            for item in self.boolean_targets:
+                row = box.row(align=True)
+                row.prop(item, "enabled", text="")
+                row.label(text=item.name)
+
+
+# Shared property annotations for the two boolean-capable tools; spread into each
+# operator's class body so they register on that operator (Blender collects an
+# operator's own annotations, not a mixin's).
+def _boolean_tool_annotations():
+    return {
+        "operation": EnumProperty(
+            name="Boolean", items=BOOLEAN_TOOL_OPERATIONS, default="Difference"
+        ),
+        "boolean_targets": CollectionProperty(type=BooleanTargetItem),
+        "boolean_detected": BoolProperty(default=False, options={"HIDDEN"}),
+    }
+
+
+BASE_STATES = (
+    state_from_args(
+        "Object",
+        description="Base object to add the nodegroup",
+        pointer="object",
+        types=(Object,),
+        use_create=False,
+    ),
+)
+
+
+def is_2d_profile(obj):
+    """Something a solid can be made from: a curve, or a sketch's body.
+
+    A sketch is picked, but the stack goes on the mesh its geometry is realised
+    on (see utilities.body): a Curves object cannot hold a stack that outputs
+    mesh, since Blender then refuses to apply it (issue #723).
+    """
+    from ..utilities.body import is_body
+
+    return obj is not None and (obj.type == "CURVE" or is_body(obj))
+
+
+def solid_target(obj):
+    """The object a solid feature belongs on: a picked sketch means its body."""
+    from ..utilities.body import body_of
+
+    return body_of(obj) or obj
+
+
+class NodeOperator(Operator3d):
+    """Base class for all node-based operators"""
+
+    bl_options = {"UNDO", "REGISTER"}
+
+    resources = ()
+
+    # Message shown when the resolved target fails is_valid_target().
+    invalid_target_msg = "Invalid target object"
+
+    # Expose the redo-panel eyedropper (framework edit-state re-entry) so a
+    # finished node op can be re-pointed at a different object/cutter. Object
+    # pointers need none of the entity stable-id machinery -- re-apply just
+    # relocates the modifier (see _prepare_edit / main).
+    editable = True
+
+    # Persisted target so the redo panel (a fresh instance) can re-resolve the
+    # object and edit the existing modifier: the pointer props rebuild
+    # ``self.object`` on the edit path, and this is a plain fallback for value
+    # tweaks. Not SKIP_SAVE; main() overwrites it every run.
+    target_name: StringProperty(options={"HIDDEN"})
+
+    # What this op's modifier was applied to before an eyedropper re-point (the
+    # object + the modifier name). Stamped by _prepare_edit so main() can drop
+    # that now-stale modifier and move it to the re-picked target instead of
+    # leaving an orphan. SKIP_SAVE: only meaningful during the edit re-pick.
+    previous_target: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+    previous_modifier: StringProperty(options={"HIDDEN", "SKIP_SAVE"})
+
+    @classmethod
+    def poll(cls, context):
+        # Available without a preselection: the state machine lets the user pick
+        # the target object in the viewport. (Objects are ray-pickable; an open
+        # profile a ray can't hit must still be selected first.)
+        return True
+
+    def state_property(self, state_index):
+        # Native Object/MeshEdge pointer states have no editable fallback
+        # property; don't advertise the "" placeholder GenericEntityOp returns
+        # for non-entity pointers (it breaks the redo panel and redo_states).
+        return None
+
+    def _prepare_pick_ui(self, context):
+        # The object-hover gizmo drives the pick highlight, but it's unlinked
+        # while a non-sketcher tool (e.g. Select) is active. Link it so the
+        # eyedropper re-pick shows hover highlight.
+        from ..declarations import GizmoGroups
+
+        context.window_manager.gizmo_group_type_ensure(GizmoGroups.ObjectHover.value)
+
+        # Re-picking a mesh element (e.g. the revolve axis edge) needs the base
+        # geometry, but the tool's modifier shows the *result* -- the profile's
+        # own edges are hidden and not ray-castable. Temporarily disable it so
+        # those edges are visible and pickable; restored in _finish_pick_ui.
+        self._hidden_modifier = None
+        state = self.get_states()[self.edit_state]
+        ob = self.resolved_object()
+        if Object not in state.types and ob is not None:  # a mesh-element pointer
+            mod = ob.modifiers.get(self._modifier_name())
+            if mod is not None and mod.show_viewport:
+                mod.show_viewport = False
+                self._hidden_modifier = (ob.name, mod.name)
+                ob.update_tag()
+                context.view_layer.update()  # force the viewport to drop the result now
+
+    def _maintain_pick_ui(self, context):
+        # The redo-panel re-run (execute of the previous op) reverts the modifier
+        # we hid in _prepare_pick_ui. Re-hide it so the base geometry stays
+        # visible/pickable for the whole re-pick.
+        hidden = getattr(self, "_hidden_modifier", None)
+        if not hidden:
+            return
+        ob = bpy.data.objects.get(hidden[0])
+        mod = ob.modifiers.get(hidden[1]) if ob else None
+        if mod is not None and mod.show_viewport:
+            mod.show_viewport = False
+            ob.update_tag()
+            context.view_layer.update()
+
+    def _finish_pick_ui(self, context):
+        hidden = getattr(self, "_hidden_modifier", None)
+        if not hidden:
+            return
+        ob = bpy.data.objects.get(hidden[0])
+        mod = ob.modifiers.get(hidden[1]) if ob else None
+        if mod is not None:
+            mod.show_viewport = True
+            ob.update_tag()
+        self._hidden_modifier = None
+
+    def _update_pick_hover(self, context, coords):
+        from .. import global_data
+        from ..gizmos.object_hover import publish_hover
+
+        if publish_hover(context, coords, global_data.hover_types) and context.area:
+            context.area.tag_redraw()
+
+    def resolved_object(self):
+        """The object to operate on: the live/restored pointer, else the
+        persisted name. The pointer props rebuild ``self.object`` on the redo/edit
+        path; ``target_name`` is a plain fallback."""
+        ob = self.object
+        if ob is None and self.target_name:
+            ob = bpy.data.objects.get(self.target_name)
+        return ob
+
+    def is_valid_target(self, obj):
+        """Whether ``obj`` may receive this node modifier. Override to restrict."""
+        # Only geometry objects: an empty (e.g. a workplane) would otherwise take
+        # a Geometry Nodes modifier that does nothing but clutter it.
+        return obj is not None and obj.type in {"MESH", "CURVE", "CURVES"}
+
+    def gather_selection(self, context):
+        # Source for the framework's prefill-from-selection: the base Object
+        # state is filled from this list on invoke (wait_for_input paths). Put
+        # the active object first and drop invalid targets so, e.g., a mesh is
+        # never prefilled for a tool that only accepts sketches.
+        active = context.active_object
+        result = [active] if active and self.is_valid_target(active) else []
+        result.extend(
+            o
+            for o in context.selected_objects
+            if o != active and self.is_valid_target(o)
+        )
+        return result
+
+    def _check_constrain(self, context, index):
+        return False
+
+    def read_props(self, modifier):
+        """Seed operator properties from an existing modifier's inputs.
+
+        Called on invoke when the target already carries this tool's modifier,
+        so re-invoking edits from the current values instead of snapping back to
+        the defaults. Override to pull the relevant sockets; base is a no-op.
+        """
+        pass
+
+    def invoke(self, context, event):
+        # With a valid preselection the base Object state prefills from it; with
+        # nothing selected we fall through to the modal state machine so the user
+        # can pick the target in the viewport instead of being blocked. The state
+        # description guides the pick, and gather_selection filters to valid
+        # targets so an invalid preselection is simply not prefilled.
+        selection = self.gather_selection(context)
+
+        # If the prefill target already carries this tool's modifier, seed the
+        # operator from its current values. Convenience only -- never let a
+        # readback mishap (e.g. a changed node group) block the tool.
+        target = selection[0] if selection else None
+        if isinstance(target, Object):
+            mod = target.modifiers.get(f"CAD_Sketcher {self.bl_label}")
+            if mod and mod.node_group:
+                try:
+                    self.read_props(mod)
+                except Exception:
+                    pass
+
+        return super().invoke(context, event)
+
+    def init(self, context, event):
+        # Concrete tools build their node group in their own init() (all groups
+        # are code-built now); this base is the framework's init() fallback.
+        # Don't push undo on the eyedropper re-pick path (edit_state >= 0):
+        # calling ed.undo_push while entering a modal from the redo panel hangs
+        # Blender.
+        if self.edit_state < 0:
+            bpy.ops.ed.undo_push(message=f"Add {self.bl_label}")
+        return True
+
+    def _modifier_name(self):
+        """Name of this tool's modifier on the target.
+
+        One per object by default (re-invoking edits it). Tools that can stack
+        several instances on one object (e.g. Boolean, one per cutter) override
+        this to return a distinct name per instance.
+        """
+        return f"CAD_Sketcher {self.bl_label}"
+
+    def _ensure_modifier(self, context):
+        """Create the modifier once, reuse on subsequent calls."""
+        ob = self._obj.original
+        mod_name = self._modifier_name()
+
+        self.modifier = ob.modifiers.get(mod_name)
+        if self.modifier:
+            return True
+
+        self.modifier = ob.modifiers.new(mod_name, "NODES")
+        nodegroup = bpy.data.node_groups.get(self.NODEGROUP_NAME)
+        if not nodegroup:
+            # "ERROR", not "Error": an unknown report type raises a ValueError and
+            # buries the actual problem.
+            self.report({"ERROR"}, f"Unable to load node group {self.NODEGROUP_NAME}")
+            return False
+        self.modifier.node_group = nodegroup
+        return True
+
+    def _prepare_edit(self, context):
+        """Edit re-pick (framework hook): remember the object + modifier name we
+        are editing away from, so main() drops that modifier if the re-pick lands
+        on a different object -- or changes a per-cutter name. Harmless when a
+        non-target state is edited: main only acts when it actually changes."""
+        ob = self.resolved_object()
+        if ob is not None:
+            self.previous_target = ob.name
+            self.previous_modifier = self._modifier_name()
+
+    def main(self, context):
+        ob = solid_target(self.resolved_object())
+        if not self.is_valid_target(ob):
+            self.report({"WARNING"}, self.invalid_target_msg)
+            return False
+
+        # Persist the target and keep a resolved reference for this run so
+        # _ensure_modifier / set_props don't re-resolve the pointer repeatedly.
+        self.target_name = ob.name
+        self._obj = ob
+
+        # Re-pointed via the eyedropper: move the modifier here by dropping it
+        # from the object/name it used to be on (see _prepare_edit).
+        if self.previous_target and (
+            self.previous_target != ob.name
+            or self.previous_modifier != self._modifier_name()
+        ):
+            prev = bpy.data.objects.get(self.previous_target)
+            if prev is not None:
+                old = prev.modifiers.get(self.previous_modifier)
+                if old is not None:
+                    prev.modifiers.remove(old)
+                    prev.update_tag()
+
+        if not self._ensure_modifier(context):
+            return False
+
+        retval = self.set_props()
+        ob.original.update_tag()
+        return retval
+
+    def set_props(self):
+        pass
+
+
+class View3D_OT_node_extrude(Operator, BooleanFromToolMixin, NodeOperator):
+    """Add an extrude modifier node group"""
+
+    bl_idname = Operators.NodeExtrude
+    bl_label = "Extrude"
+
+    NODEGROUP_NAME = "CAD Sketcher Extrude"
+    # Built programmatically (not shipped as an asset); see init().
+    resources = ()
+    return_to_tool = BLENDER_SELECT_TOOL
+
+    invalid_target_msg = "Select a sketch or curve to extrude (2D profile)"
+
+    def is_valid_target(self, obj):
+        return is_2d_profile(obj)
+
+    offset: FloatProperty(name="Offset", subtype="DISTANCE", options={"SKIP_SAVE"})
+    mirror: BoolProperty(name="Mirror Extrude")
+    asymmetry: BoolProperty(name="Asymmetric")
+    asymmetry_distance: FloatProperty(name="Asymmetry Distance", subtype="DISTANCE")
+
+    states = (
+        *BASE_STATES,
+        state_from_args(
+            "Offset",
+            description="Offset vector to apply to the selection of entities",
+            property="offset",
+            state_func="get_offset",
+            interactive=True,
+        ),
+    )
+
+    def get_offset(self, context: Context, coords):
+        pos = get_placement_pos(context, coords)
+        if pos is None:
+            return 0.0
+
+        mat = self.object.original.matrix_world.inverted()
+        delta = (mat @ Vector(pos)).z
+        return delta
+
+    def init(self, context: Context, event: Event):
+        # Build the extrude node group in place of loading an asset, then teach it
+        # to turn a non-filled (wire) profile into open walls (a no-op on groups
+        # already carrying the patch).
+        from ..utilities.extrude_nodes import (
+            build_extrude_node_group,
+            ensure_extrude_edge_walls,
+        )
+
+        build_extrude_node_group()
+        ensure_extrude_edge_walls(bpy.data.node_groups.get(self.NODEGROUP_NAME))
+        if self.edit_state < 0:  # not on the eyedropper re-pick (see NodeOperator.init)
+            bpy.ops.ed.undo_push(message="Add Extrude")
+        self.reset_booleans()
+        return True
+
+    def fini(self, context: Context, succeede: bool):
+        if succeede:
+            self.finish_booleans(context)
+
+    def set_props(self):
+        from ..utilities.extrude_nodes import _input_ids
+
+        m = self.modifier
+        # Resolve by socket name: a code-built group assigns its own identifiers,
+        # so the old baked-in "Input_N" strings no longer apply.
+        ids = _input_ids(m.node_group)
+        set_modifier_input(m, ids["Size"], self.offset)
+        set_modifier_input(m, ids["Mirror Extrude"], self.mirror)
+        set_modifier_input(m, ids["Asymmetry Override"], self.asymmetry)
+        set_modifier_input(m, ids["Asymmetry Distance"], self.asymmetry_distance)
+        return True
+
+    def draw_settings(self, context):
+        layout = self.layout
+        layout.prop(self, "mirror")
+        layout.prop(self, "asymmetry")
+        sub = layout.column()
+        sub.enabled = self.asymmetry
+        sub.prop(self, "asymmetry_distance")
+        self.draw_boolean_settings(layout)
+
+
+class AxisOverlayMixin:
+    """Draw the axes on offer while the state that works off one is running.
+
+    The concrete operator names that state in ``AXIS_STATE``: the axes are drawn
+    (and the one under the cursor highlighted by the hover gizmo) for as long as
+    it runs, and put away when the run ends. What the axes are is up to
+    ``utilities.workplane``: the frame of the part in focus, or the world's.
+    """
+
+    AXIS_STATE = "Axis"
+
+    def fini(self, context: Context, succeede: bool):
+        self._show_axes(False)
+
+    def set_state(self, context: Context, index: int):
+        super().set_state(context, index)
+        self._show_axes(self.get_states()[index].name == self.AXIS_STATE)
+
+    def _prepare_pick_ui(self, context):
+        # A re-pick starts in one state without running the tool from the top,
+        # so the axes have to be asked for here as well.
+        super()._prepare_pick_ui(context)
+        self._show_axes(self.get_states()[self.edit_state].name == self.AXIS_STATE)
+
+    def _maintain_pick_ui(self, context):
+        # The redo-panel re-run calls fini() behind this modal, which puts the
+        # axes away again; ask for them back every event, as the base class does
+        # for the rest of the pick UI.
+        super()._maintain_pick_ui(context)
+        self._show_axes(self.get_states()[self.edit_state].name == self.AXIS_STATE)
+
+    def _finish_pick_ui(self, context):
+        super()._finish_pick_ui(context)
+        self._show_axes(False)
+
+    @staticmethod
+    def _show_axes(visible: bool):
+        """Draw the axes on offer, or put them away (see draw_axis_candidates)."""
+        from .. import global_data
+
+        global_data.axis_picker = visible
+        if not visible:
+            global_data.hover_axis = None
+
+    def axis_under_cursor(self, context, coords):
+        """World endpoints of the axis-like line under the cursor, or None.
+
+        A drawn frame axis, a curve/sketch segment or a mesh edge -- the same
+        things a revolve axis can be picked from. Everything is judged in screen
+        space, so hovering a face is not the same as hovering its edges.
+        """
+        from ..utilities.view import curve_segment_under_cursor
+        from ..utilities.workplane import axis_endpoints, hit_test_axis
+
+        radius = 12.0 * context.preferences.system.ui_scale
+
+        _pick_id, plane, index = hit_test_axis(context, coords, radius)
+        if plane is not None:
+            return axis_endpoints(plane, index, context)
+
+        hit = curve_segment_under_cursor(context, coords, radius)
+        if hit is not None:
+            obj, point_index = hit
+            points = getattr(obj.data, "points", None)
+            if points is not None and point_index + 1 < len(points):
+                mw = obj.matrix_world
+                return (
+                    mw @ Vector(points[point_index].position),
+                    mw @ Vector(points[point_index + 1].position),
+                )
+
+        return self._mesh_edge_under_cursor(context, coords, radius)
+
+    @staticmethod
+    def _mesh_edge_under_cursor(context, coords, radius):
+        """World endpoints of a mesh edge within ``radius`` pixels, or None."""
+        from bpy_extras.view3d_utils import location_3d_to_region_2d
+
+        from ..stateful_operator.utilities.geometry import (
+            evaluated_surface_mesh,
+            get_mesh_element,
+        )
+        from ..utilities.workplane import distance_to_segment
+
+        ob, element, index = get_mesh_element(context, coords, edge=True)
+        if ob is None or element != "EDGE":
+            return None
+
+        with evaluated_surface_mesh(context, ob) as (me, mw):
+            if me is None or index >= len(me.edges):
+                return None
+            i0, i1 = me.edges[index].vertices
+            ends = (mw @ me.vertices[i0].co, mw @ me.vertices[i1].co)
+
+        # The raycast hits anywhere on a face, so the nearest edge of that face
+        # can be far from the cursor: only a line the cursor is actually on
+        # counts as the axis to follow.
+        region, rv3d = context.region, context.region_data
+        on_screen = [location_3d_to_region_2d(region, rv3d, end) for end in ends]
+        if any(point is None for point in on_screen):
+            return None
+        if distance_to_segment(Vector(coords), *on_screen) > radius:
+            return None
+        return ends
+
+
+class PickedAxisMixin(AxisOverlayMixin):
+    """Pick an axis to work around: an edge, a curve/sketch line or a base axis.
+
+    Mixed into the revolve and circular-array operators. The concrete operator
+    declares the two properties below (so they register on that operator), puts
+    an ``Axis`` pointer state at ``AXIS_STATE_INDEX`` and reads the result with
+    ``resolve_axis``:
+
+        axis_origin: FloatVectorProperty(size=3, subtype="XYZ", options={"HIDDEN"})
+        axis_direction: FloatVectorProperty(size=3, subtype="XYZ", options={"HIDDEN"})
+
+    They hold the raw picked axis in object space so the redo panel can re-apply
+    the run without the transient axis pointer; hence no SKIP_SAVE.
+    """
+
+    AXIS_STATE_INDEX = 1
+
+    def get_point(self, context, index):
+        # The axis is a picked edge, resolved to endpoints in set_props; there
+        # is no entity to return here.
+        return None
+
+    def pick_element(self, context, coords):
+        # Mesh edges pick through the framework (object-agnostic now). Curves
+        # aren't ray-castable, so fall back to the shared screen-space
+        # curve-segment pick -- the same one the hover gizmo uses, so the
+        # highlight and the pick agree.
+        from ..utilities.view import curve_segment_under_cursor
+        from ..utilities.workplane import hit_test_axis
+
+        radius = 12.0 * context.preferences.system.ui_scale
+
+        # A base plane's own direction, first: the axes are drawn on top and run
+        # through the part they belong to, so there is nearly always geometry
+        # behind them, and the mesh pick would always win. The plane empty is
+        # the pointer, so the axis follows the part it is in.
+        _pick_id, plane, index = hit_test_axis(context, coords, radius)
+        if plane is not None:
+            self.state_data["type"] = MeshEdge
+            return plane.name, index
+
+        result = super().pick_element(context, coords)
+        if result is not None:
+            return result
+
+        hit = curve_segment_under_cursor(context, coords, radius)
+        if hit is not None:
+            obj, point_index = hit
+            self.state_data["type"] = MeshEdge
+            return obj.name, point_index
+        return None
+
+    def _axis_endpoints(self):
+        """World endpoints of the picked axis, or None.
+
+        A mesh edge, a curve segment, or one of a base plane's own directions
+        (picked as the plane empty plus which direction it is).
+        """
+        try:
+            ob_name, index = self.get_state_pointer(
+                index=self.AXIS_STATE_INDEX, implicit=True
+            )
+        except Exception:
+            return None
+        ob = bpy.data.objects.get(ob_name)
+        if ob is None:
+            return None
+        if ob.type == "EMPTY":
+            from ..utilities.workplane import axis_endpoints
+
+            return axis_endpoints(ob, index)
+        if ob.type in {"CURVE", "CURVES"}:
+            pts = getattr(ob.data, "points", None)
+            if pts is None or index + 1 >= len(pts):
+                return None
+            mw = ob.matrix_world
+            return mw @ Vector(pts[index].position), mw @ Vector(
+                pts[index + 1].position
+            )
+        eob = ob.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        me = eob.data
+        if not hasattr(me, "edges") or index >= len(me.edges):
+            return None
+        i0, i1 = me.edges[index].vertices
+        mw = eob.matrix_world
+        return mw @ Vector(me.vertices[i0].co), mw @ Vector(me.vertices[i1].co)
+
+    def _has_stored_axis(self):
+        return Vector(self.axis_direction).length > 1e-9
+
+    def has_axis(self):
+        """Whether the run has an axis at all: freshly picked or persisted.
+
+        Without one the modifier would sit on the node group's default axis and
+        generate something the user never asked for.
+        """
+        return self._axis_endpoints() is not None or self._has_stored_axis()
+
+    def resolve_axis(self):
+        """The picked axis in the object's local space as (origin, direction).
+
+        A fresh pick is persisted on the way out so a later redo can reuse it;
+        on the redo path the stored axis is returned. None if there is neither.
+        """
+        ends = self._axis_endpoints()
+        if ends is not None:
+            w0, w1 = ends
+            inv = self._obj.original.matrix_world.inverted()
+            origin = inv @ w0
+            direction = (inv @ w1) - origin
+            if direction.length < 1e-9:
+                return None
+            direction.normalize()
+            self.axis_origin = origin
+            self.axis_direction = direction
+            return origin, direction
+        if self._has_stored_axis():
+            return Vector(self.axis_origin), Vector(self.axis_direction)
+        return None
+
+
+def second_array_axis(offset: Vector, offset_2: Vector) -> tuple:
+    """Direction and spacing of an array's second axis.
+
+    An explicit ``offset_2`` is used as is. When it's zero, the grid continues at
+    a right angle to ``offset`` in the object's XY plane (where sketches lie)
+    with the same spacing, so turning on a second row gives a square grid.
+    """
+    if offset_2.length > 1e-6:
+        return offset_2.normalized(), offset_2.length
+    perpendicular = Vector((-offset.y, offset.x, 0.0))
+    if perpendicular.length < 1e-6:
+        perpendicular = Vector((0.0, 1.0, 0.0))
+    return perpendicular.normalized(), offset.length
+
+
+def offset_along_axis(inverse, ends, hit) -> Vector:
+    """The array offset for a drag that followed the axis ``ends``.
+
+    All three come in world space (``inverse`` is the object's inverted matrix);
+    the offset comes back in the object's local space, pointing along the axis
+    and as long as the drag reached along it. None if the axis is degenerate.
+    """
+    direction = (inverse @ ends[1]) - (inverse @ ends[0])
+    if direction.length < 1e-9:
+        return None
+    direction.normalize()
+    return direction * (inverse @ hit).dot(direction)
+
+
+class View3D_OT_node_array_linear(Operator, AxisOverlayMixin, NodeOperator):
+    """Add a linear array of the selected element"""
+
+    bl_idname = Operators.NodeArrayLinear
+    bl_label = "Linear Array"
+
+    NODEGROUP_NAME = "CAD Sketcher Linear Array"
+    # Built programmatically (not shipped as an asset); see init().
+    resources = ()
+    return_to_tool = BLENDER_SELECT_TOOL
+    # The axes are on offer for the whole drag: hovering one makes the array
+    # follow it (see get_offset).
+    AXIS_STATE = "Offset"
+
+    def init(self, context: Context, event: Event):
+        from ..utilities.array_nodes import build_array_node_group
+
+        build_array_node_group()
+        if self.edit_state < 0:  # not on the eyedropper re-pick (see NodeOperator.init)
+            bpy.ops.ed.undo_push(message="Add Linear Array")
+        return True
+
+    # Array offset in the object's local space (direction * spacing), captured
+    # by a single interactive drag; direction and distance derive from it.
+    offset: FloatVectorProperty(
+        name="Offset", subtype="TRANSLATION", size=3, options={"SKIP_SAVE"}
+    )
+    count: IntProperty(name="Count", default=2, min=2)
+    use_total_distance: BoolProperty(
+        name="Use Total Distance",
+        description="Treat distance as the total span rather than per-item spacing",
+    )
+    align_rotation: BoolProperty(name="Align Rotation")
+    merge: BoolProperty(name="Merge by Distance")
+    merge_distance: FloatProperty(
+        name="Merge Distance", default=0.001, min=0.0, subtype="DISTANCE"
+    )
+    count_2: IntProperty(
+        name="Count 2",
+        description="Copies along the second direction (1 keeps a single row)",
+        default=1,
+        min=1,
+    )
+    offset_2: FloatVectorProperty(
+        name="Offset 2",
+        description=(
+            "Second direction and spacing; zero uses the first spacing at a right "
+            "angle in the object's XY plane"
+        ),
+        subtype="TRANSLATION",
+        size=3,
+    )
+
+    states = (
+        *BASE_STATES,
+        state_from_args(
+            "Offset",
+            description="Drag to set the array direction and spacing",
+            property="offset",
+            state_func="get_offset",
+            interactive=True,
+            axis_lock=True,
+        ),
+        state_from_args(
+            "Count",
+            description="Amount of created elements",
+            property="count",
+            interactive=True,
+            optional=True,
+            state_func="get_count",
+        ),
+    )
+
+    def get_offset(self, context: Context, coords):
+        # The drag offset (origin -> cursor) in the object's local space; the
+        # local origin is (0,0,0), so the local hit point is the offset.
+        # Return a Vector (not a tuple) so it's set as one vector property value.
+        obj = self.object.original
+        origin = obj.matrix_world.translation
+        inv = obj.matrix_world.inverted()
+        ray_o, ray_dir = get_picking_origin_dir(context, coords)
+
+        # X/Y/Z lock: constrain to a global axis line through the origin, using
+        # the point on that line closest to the view ray (view-angle robust).
+        if self._axis_lock is not None:
+            axis = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))[self._axis_lock]
+            res = intersect_line_line(
+                origin, origin + Vector(axis), ray_o, ray_o + ray_dir
+            )
+            if res is None:
+                return Vector((0.0, 0.0, 0.0))
+            return inv @ res[0]
+
+        # Hovering one of the axes on offer (or an edge, or a sketch line): the
+        # array runs along it and the drag only says how far, which is how a row
+        # is put on an existing direction instead of eyeballed.
+        ends = self.axis_under_cursor(context, coords)
+        if ends is not None:
+            res = intersect_line_line(*ends, ray_o, ray_o + ray_dir)
+            if res is not None:
+                offset = offset_along_axis(inv, ends, res[0])
+                if offset is not None:
+                    return offset
+
+        # Free drag: project onto the view-facing plane through the origin.
+        view_dir = context.region_data.view_rotation @ Vector((0.0, 0.0, -1.0))
+        hit = intersect_line_plane(ray_o, ray_o + ray_dir, origin, view_dir)
+        if hit is None:
+            return Vector((0.0, 0.0, 0.0))
+        return inv @ hit
+
+    def get_count(self, context: Context, coords):
+        retval = super().state_func(context, coords)
+        return abs(retval) + 2
+
+    def set_props(self):
+        offset = Vector(self.offset)
+        if offset.length > 1e-6:
+            direction = offset.normalized()
+            distance = offset.length
+        else:
+            direction = Vector((1.0, 0.0, 0.0))
+            distance = 0.0
+
+        from ..utilities.array_nodes import _input_ids
+
+        m = self.modifier
+        # Resolve by socket name: a code-built group assigns its own identifiers,
+        # so the old baked-in "Input_N" strings no longer apply. ("Flip Direciton"
+        # keeps the asset's original misspelling to stay socket-compatible.)
+        ids = _input_ids(m.node_group)
+        set_modifier_input(m, ids["Direction"], tuple(direction))
+        set_modifier_input(m, ids["Count"], self.count)
+        set_modifier_input(m, ids["Spacing / Total distance"], distance)
+        set_modifier_input(m, ids["Use Total Distance"], self.use_total_distance)
+        set_modifier_input(m, ids["Align Rotation"], self.align_rotation)
+        set_modifier_input(m, ids["Merge by Distance"], self.merge)
+        set_modifier_input(m, ids["Merge Distance"], self.merge_distance)
+        direction_2, distance_2 = second_array_axis(offset, Vector(self.offset_2))
+        set_modifier_input(m, ids["Count 2"], self.count_2)
+        set_modifier_input(m, ids["Direction 2"], tuple(direction_2))
+        set_modifier_input(m, ids["Spacing 2"], distance_2)
+        return True
+
+    def draw_settings(self, context):
+        # The first direction's Offset and Count are the framework's state rows
+        # above; the second direction follows them, then what applies to both.
+        layout = self.layout
+        layout.separator()
+        layout.label(text="Second Direction")
+        layout.prop(self, "count_2", text="Count")
+        # The offset means nothing for a single row, so don't show it at all.
+        if self.count_2 > 1:
+            layout.prop(self, "offset_2", text="")
+
+        layout.separator()
+        layout.label(text="Options")
+        layout.prop(self, "use_total_distance")
+        layout.prop(self, "align_rotation")
+        layout.prop(self, "merge")
+        sub = layout.column()
+        sub.enabled = self.merge
+        sub.prop(self, "merge_distance")
+
+
+class View3D_OT_node_revolve(
+    Operator, BooleanFromToolMixin, PickedAxisMixin, NodeOperator
+):
+    """Revolve a 2D profile around a picked axis"""
+
+    bl_idname = Operators.NodeRevolve
+    bl_label = "Revolve"
+
+    NODEGROUP_NAME = "CAD Sketcher Revolve"
+    # Built programmatically (not shipped as an asset); see init()/main().
+    resources = ()
+    return_to_tool = BLENDER_SELECT_TOOL
+
+    invalid_target_msg = "Select a sketch, curve or mesh profile to revolve"
+
+    angle: FloatProperty(
+        name="Angle",
+        subtype="ANGLE",
+        default=math.tau,
+        min=-math.tau,
+        max=math.tau,
+        options={"SKIP_SAVE"},
+    )
+    angular_resolution: FloatProperty(
+        name="Angular Resolution",
+        description="Maximum angle per segment; the step count adapts to the "
+        "revolve angle to keep a consistent smoothness",
+        subtype="ANGLE",
+        default=math.radians(2),
+        min=math.radians(0.5),
+        soft_max=math.radians(90),
+    )
+    flip: BoolProperty(name="Flip Direction")
+
+    # Raw picked axis (object space, un-flipped), persisted so the redo panel
+    # can re-apply the revolve without the transient axis pointer. Not
+    # SKIP_SAVE: must survive redo; a fresh invoke re-picks before main() runs.
+    axis_origin: FloatVectorProperty(size=3, subtype="XYZ", options={"HIDDEN"})
+    axis_direction: FloatVectorProperty(size=3, subtype="XYZ", options={"HIDDEN"})
+
+    states = (
+        *BASE_STATES,
+        state_from_args(
+            "Axis",
+            description="Click an axis, a mesh edge or a curve/sketch line to "
+            "revolve around",
+            pointer="axis",
+            types=(MeshEdge,),
+            use_create=False,
+        ),
+    )
+
+    def is_valid_target(self, obj):
+        # Curves and sketches, plus mesh profiles (edge paths) -- the node group
+        # converts mesh edges to a curve, so a poly-line/silhouette mesh works
+        # too, matching Blender's Screw modifier.
+        return obj is not None and obj.type in {"CURVE", "CURVES", "MESH"}
+
+    @staticmethod
+    def _input_ids(node_group):
+        from ..utilities.revolve_nodes import _input_ids
+
+        return _input_ids(node_group)
+
+    def init(self, context: Context, event: Event):
+        # Build the revolve node group in place of loading an asset.
+        from ..utilities.revolve_nodes import build_revolve_node_group
+
+        build_revolve_node_group()
+        if self.edit_state < 0:  # not on the eyedropper re-pick (see NodeOperator.init)
+            bpy.ops.ed.undo_push(message="Add Revolve")
+        self.reset_booleans()
+        return True
+
+    def fini(self, context: Context, succeede: bool):
+        super().fini(context, succeede)
+        if succeede:
+            self.finish_booleans(context)
+
+    def read_props(self, modifier):
+        # Seed the angle/resolution from the existing revolve so re-invoking on
+        # the same object continues from its current sweep. The axis is re-picked
+        # each run (and flip isn't stored in the modifier), so neither is read.
+        from ..utilities.revolve_nodes import _input_ids
+
+        ids = _input_ids(modifier.node_group)
+        self.angle = get_modifier_input(modifier, ids["Angle"])
+        self.angular_resolution = get_modifier_input(
+            modifier, ids["Angular Resolution"]
+        )
+
+    def main(self, context):
+        from ..utilities.revolve_nodes import build_revolve_node_group
+
+        build_revolve_node_group()  # ensure it exists on the redo path too
+        if not self.has_axis():
+            return False
+        return super().main(context)
+
+    def set_props(self):
+        axis = self.resolve_axis()
+        if axis is None:
+            self.report({"WARNING"}, "Pick a revolve axis (an edge or line)")
+            return False
+        origin, direction = axis
+
+        # Apply flip at write time (not baked into the stored axis) so toggling
+        # it in the redo panel works.
+        final_dir = -direction if self.flip else direction
+
+        m = self.modifier
+        ids = self._input_ids(m.node_group)
+        set_modifier_input(m, ids["Axis Origin"], tuple(origin))
+        set_modifier_input(m, ids["Axis Direction"], tuple(final_dir))
+        set_modifier_input(m, ids["Angle"], self.angle)
+        set_modifier_input(m, ids["Angular Resolution"], self.angular_resolution)
+        return True
+
+    def draw_settings(self, context):
+        layout = self.layout
+        row = layout.row(align=True)
+        row.prop(self, "angle")
+        row.prop(self, "flip", text="", icon="ARROW_LEFTRIGHT")
+        layout.prop(self, "angular_resolution")
+        self.draw_boolean_settings(layout)
+
+
+class View3D_OT_node_array_circular(Operator, PickedAxisMixin, NodeOperator):
+    """Add a circular array of the selected element around a picked axis"""
+
+    bl_idname = Operators.NodeArrayCircular
+    bl_label = "Circular Array"
+
+    NODEGROUP_NAME = "CAD Sketcher Circular Array"
+    # Built programmatically (not shipped as an asset); see init()/main().
+    resources = ()
+    return_to_tool = BLENDER_SELECT_TOOL
+
+    count: IntProperty(name="Count", default=6, min=2)
+    angle: FloatProperty(
+        name="Angle",
+        description="The whole sweep the copies are spread over, or the turn "
+        "between two copies with Use Total Angle off",
+        subtype="ANGLE",
+        default=math.tau,
+        min=-math.tau,
+        max=math.tau,
+    )
+    use_total_angle: BoolProperty(
+        name="Use Total Angle",
+        description="Treat the angle as the whole sweep rather than the turn "
+        "between two copies",
+        default=True,
+    )
+    align_rotation: BoolProperty(
+        name="Align Rotation",
+        description="Turn each copy with the pattern (a bolt circle); off keeps "
+        "the original orientation while the copy travels round",
+        default=True,
+    )
+    merge: BoolProperty(name="Merge by Distance")
+    merge_distance: FloatProperty(
+        name="Merge Distance", default=0.001, min=0.0, subtype="DISTANCE"
+    )
+
+    # See PickedAxisMixin for what these hold and why they are not SKIP_SAVE.
+    axis_origin: FloatVectorProperty(size=3, subtype="XYZ", options={"HIDDEN"})
+    axis_direction: FloatVectorProperty(size=3, subtype="XYZ", options={"HIDDEN"})
+
+    states = (
+        *BASE_STATES,
+        state_from_args(
+            "Axis",
+            description="Click an axis, a mesh edge or a curve/sketch line to "
+            "pattern around",
+            pointer="axis",
+            types=(MeshEdge,),
+            use_create=False,
+        ),
+        state_from_args(
+            "Count",
+            description="Amount of created elements",
+            property="count",
+            interactive=True,
+            optional=True,
+            state_func="get_count",
+        ),
+    )
+
+    @staticmethod
+    def _input_ids(node_group):
+        from ..utilities.circular_array_nodes import _input_ids
+
+        return _input_ids(node_group)
+
+    def init(self, context: Context, event: Event):
+        from ..utilities.circular_array_nodes import build_circular_array_node_group
+
+        build_circular_array_node_group()
+        if self.edit_state < 0:  # not on the eyedropper re-pick (see NodeOperator.init)
+            bpy.ops.ed.undo_push(message="Add Circular Array")
+        return True
+
+    def get_count(self, context: Context, coords):
+        retval = super().state_func(context, coords)
+        return abs(retval) + 2
+
+    def read_props(self, modifier):
+        # Re-invoking on an object that already has the array continues from its
+        # current settings. The axis is re-picked each run, so it isn't read.
+        ids = self._input_ids(modifier.node_group)
+        self.count = get_modifier_input(modifier, ids["Count"])
+        self.angle = get_modifier_input(modifier, ids["Angle / Total angle"])
+        self.use_total_angle = get_modifier_input(modifier, ids["Use Total Angle"])
+        self.align_rotation = get_modifier_input(modifier, ids["Align Rotation"])
+        self.merge = get_modifier_input(modifier, ids["Merge by Distance"])
+        self.merge_distance = get_modifier_input(modifier, ids["Merge Distance"])
+
+    def main(self, context):
+        from ..utilities.circular_array_nodes import build_circular_array_node_group
+
+        build_circular_array_node_group()  # exists on the redo path too
+        if not self.has_axis():
+            return False
+        return super().main(context)
+
+    def set_props(self):
+        axis = self.resolve_axis()
+        if axis is None:
+            self.report({"WARNING"}, "Pick an axis to pattern around (an edge or line)")
+            return False
+        origin, direction = axis
+
+        m = self.modifier
+        ids = self._input_ids(m.node_group)
+        set_modifier_input(m, ids["Axis"], tuple(direction))
+        set_modifier_input(m, ids["Center"], tuple(origin))
+        set_modifier_input(m, ids["Count"], self.count)
+        set_modifier_input(m, ids["Angle / Total angle"], self.angle)
+        set_modifier_input(m, ids["Use Total Angle"], self.use_total_angle)
+        set_modifier_input(m, ids["Align Rotation"], self.align_rotation)
+        set_modifier_input(m, ids["Merge by Distance"], self.merge)
+        set_modifier_input(m, ids["Merge Distance"], self.merge_distance)
+        return True
+
+    def draw_settings(self, context):
+        # The Axis pick and Count are the framework's state rows above.
+        layout = self.layout
+        layout.prop(
+            self, "angle", text="Total Angle" if self.use_total_angle else "Step Angle"
+        )
+        layout.prop(self, "use_total_angle")
+
+        layout.separator()
+        layout.label(text="Options")
+        layout.prop(self, "align_rotation")
+        layout.prop(self, "merge")
+        sub = layout.column()
+        sub.enabled = self.merge
+        sub.prop(self, "merge_distance")
+
+
+class View3D_OT_node_boolean(Operator, NodeOperator):
+    """Nondestructively boolean the active object with a cutter object"""
+
+    bl_idname = Operators.NodeBoolean
+    bl_label = "Boolean"
+
+    NODEGROUP_NAME = "CAD Sketcher Boolean"
+    # Built programmatically (not shipped as an asset); see init().
+    resources = ()
+
+    invalid_target_msg = "Pick a body (mesh or sketch) to receive the boolean"
+
+    # Two object states: the body (receives the modifier) and the cutter. Both
+    # can be preselected (body active, cutter also selected) or picked in the
+    # viewport, matching the other node tools.
+    states = (
+        *BASE_STATES,
+        state_from_args(
+            "Cutter",
+            description="Pick the object to boolean the body with",
+            pointer="cutter",
+            types=(Object,),
+            use_create=False,
+        ),
+    )
+
+    operation: bpy.props.EnumProperty(
+        name="Operation",
+        items=(
+            ("Difference", "Difference", "Subtract the cutter from the body"),
+            ("Union", "Union", "Merge the cutter into the body"),
+            ("Intersect", "Intersect", "Keep only the overlap"),
+        ),
+        default="Difference",
+    )
+    # Off by default like every other boolean here: it multiplies the Exact
+    # solver's cost and only matters for input that intersects itself.
+    self_intersection: BoolProperty(name="Self Intersection", default=False)
+    hole_tolerant: BoolProperty(name="Hole Tolerant", default=False)
+    boolean_solver: bpy.props.EnumProperty(
+        name="Boolean Solver",
+        items=SOLVER_ITEMS,
+        default="Exact",
+    )
+
+    # A solid cutter would hide the boolean result, so its viewport display is
+    # switched once the cut is made. display_type is a draw-only property, so
+    # setting it is cheap and does not rebuild the depsgraph.
+    cutter_display: bpy.props.EnumProperty(
+        name="Cutter Display",
+        items=(
+            (
+                "AUTO",
+                "Automatic",
+                "Hide the cutter once it is cutting a part, as the Extrude and "
+                "Revolve booleans do, and show it as wireframe where it would "
+                "otherwise be lost",
+            ),
+            ("WIRE", "Wire", "Show the cutter as wireframe so the result is visible"),
+            ("SOLID", "Solid", "Leave the cutter shaded solid"),
+        ),
+        default="AUTO",
+    )
+
+    # Persist the picked cutter so the redo panel can re-apply and edit it (the
+    # pointer state, like the base object pointer, is transient across redo).
+    cutter_name: StringProperty(name="Cutter")
+
+    # Both operands may be a mesh or a sketch (Curves).
+    def is_valid_target(self, obj):
+        return obj is not None and obj.type in {"MESH", "CURVE", "CURVES"}
+
+    def get_point(self, context, index):
+        # Object pointer states carry no implicit point.
+        return None
+
+    def invoke(self, context, event):
+        # Editing: when the body and the cutter are both preselected and that
+        # cutter already has a boolean on the body, seed the operator from it so
+        # re-invoking edits the existing boolean (like Extrude) instead of
+        # resetting it to defaults. Seeding must happen here, once, before the
+        # redo panel -- doing it in main()/execute() would clobber a redo-panel
+        # edit on the next re-run. The cutter is only known at invoke when it is
+        # preselected, so interactive cutter-picking is always treated as create.
+        # A new boolean starts from the preference rather than the operator's
+        # remembered last value; an existing boolean read below overrides it.
+        self.boolean_solver = default_boolean_solver()
+        selection = self.gather_selection(context)
+        if selection:
+            body = selection[0]
+            for other in selection[1:]:
+                mod = body.modifiers.get(f"CAD_Sketcher Boolean {other.name}")
+                if mod and mod.node_group:
+                    try:
+                        self.read_props(mod)
+                    except Exception:
+                        pass
+                    break
+        return super().invoke(context, event)
+
+    def init(self, context: Context, event: Event):
+        # Build the boolean node group in place of loading an asset.
+        from ..utilities.boolean_nodes import build_boolean_node_group
+
+        build_boolean_node_group()
+        if self.edit_state < 0:  # not on the eyedropper re-pick (see NodeOperator.init)
+            bpy.ops.ed.undo_push(message="Add Boolean")
+        return True
+
+    def _prepare_edit(self, context):
+        # Resolve the current cutter so the base's _prepare_edit can stamp the
+        # per-cutter modifier name it is editing away from (self._cutter is what
+        # _modifier_name reads, and it is otherwise only set in main()).
+        cutter = self._resolve_cutter(context)
+        if cutter is None:
+            return
+        self._cutter = cutter
+        super()._prepare_edit(context)
+
+    def _resolve_cutter(self, context: Context):
+        """The cutter object: the picked pointer, else the persisted name (redo).
+
+        Like the base Object pointer, the ``cutter`` pointer state carries the
+        interactive/prefilled pick and is rebuilt from the persisted pointer
+        props on redo; ``cutter_name`` is a further fallback.
+        """
+        cutter = getattr(self, "cutter", None)
+        if cutter is not None:
+            # The Object pointer state returns the EVALUATED object (a temporary
+            # depsgraph copy). Assigning that to the modifier's Object input
+            # corrupts ID refcounts ("user decrement error") and setting its
+            # display_type is lost on the next evaluation. Use the original.
+            cutter = cutter.original
+        elif self.cutter_name:
+            cutter = bpy.data.objects.get(self.cutter_name)
+        return cutter
+
+    def _modifier_name(self):
+        # One modifier per cutter, so several booleans stack on the same body
+        # instead of overwriting each other. Re-applying with the same cutter
+        # edits its existing modifier (same name); a new cutter adds another.
+        return boolean_modifier_name(self._cutter)
+
+    def read_props(self, modifier):
+        ids = boolean_input_ids(modifier.node_group)
+        self.operation = get_boolean_operation(modifier, ids["Operation"])
+        self.self_intersection = get_modifier_input(modifier, ids["Self Intersection"])
+        self.hole_tolerant = get_modifier_input(modifier, ids["Hole Tolerant"])
+        if SOLVER_SOCKET in ids:  # absent on a group not yet rebuilt to version 4
+            self.boolean_solver = get_boolean_solver(modifier, ids[SOLVER_SOCKET])
+
+    def main(self, context: Context):
+        from ..utilities.boolean_nodes import build_boolean_node_group
+
+        build_boolean_node_group()  # ensure it exists on the redo path too
+
+        cutter = self._resolve_cutter(context)
+        if cutter is None:
+            self.report({"WARNING"}, "Pick a cutter object to boolean with")
+            return False
+        # A non-geometry cutter (empty, light, camera) yields no mesh, so the
+        # boolean would silently do nothing. Reject it with a clear message.
+        if not self.is_valid_target(cutter):
+            self.report({"WARNING"}, "The cutter must be a mesh or sketch object")
+            return False
+        # Adding this boolean makes the body read the cutter's geometry (body
+        # depends on cutter). If the cutter already depends on the body through
+        # other CAD Sketcher booleans -- including the cutter being the body
+        # itself -- that closes a depsgraph dependency cycle, which crashes
+        # Blender. Refuse before creating the modifier. Compare originals: the
+        # cutters read off the modifiers are originals, but resolved_object()
+        # may hand back the evaluated body.
+        body = self.resolved_object()
+        if body is not None:
+            body = body.original
+        if creates_boolean_cycle(body, cutter):
+            self.report(
+                {"WARNING"},
+                "That cutter depends on the body; it would create a dependency cycle",
+            )
+            return False
+        self.cutter_name = cutter.name
+        self._cutter = cutter
+        return super().main(context)
+
+    def fini(self, context: Context, succeed: bool):
+        # Reveal the result: a solid cutter sitting over the body would hide it.
+        # Done here, once, rather than in main() -- main() can re-run during the
+        # modal's undo/redo churn, so the display change belongs at completion.
+        cutter = getattr(self, "_cutter", None)
+        if not succeed or cutter is None:
+            return
+
+        # A cut belongs to what it cuts, however it was made: the same rule the
+        # extrude and revolve tools apply. Only sketch cutters, so a body with a
+        # history of its own stays a part rather than being absorbed.
+        from ..model.sketch_ref import is_sketch_object
+        from ..utilities.collections import sync_part_collections
+        from ..utilities.part import settle_membership, update_cutter_display
+
+        body = self.resolved_object()
+        bodies = [body.original] if body is not None else []
+        if body is not None and is_sketch_object(cutter):
+            settle_membership(cutter, bodies, context)
+            sync_part_collections(context.scene)
+
+        # Display last: the rule reads which part the cutter ended up in, so it
+        # has to run after membership is settled. This tool used to always leave
+        # the cutter as wireframe, which made the same cut look different
+        # depending on whether it came from here or from Extrude.
+        if self.cutter_display == "AUTO":
+            update_cutter_display(cutter, bodies, True)
+        else:
+            cutter.hide_viewport = False
+            cutter.display_type = self.cutter_display
+
+    def set_props(self):
+        m = self.modifier
+        ids = boolean_input_ids(m.node_group)
+        set_modifier_input(m, ids["Cutter"], self._cutter)
+        set_boolean_operation(m, ids["Operation"], self.operation)
+        set_modifier_input(m, ids["Self Intersection"], self.self_intersection)
+        set_modifier_input(m, ids["Hole Tolerant"], self.hole_tolerant)
+        set_boolean_solver(m, ids[SOLVER_SOCKET], self.boolean_solver)
+        return True
+
+    def draw_settings(self, context):
+        # The Cutter pointer is drawn (with its eyedropper) by the framework's
+        # per-state row; only the non-pointer options belong here.
+        layout = self.layout
+        layout.prop(self, "operation")
+        layout.prop(self, "boolean_solver")
+        layout.prop(self, "cutter_display")
+        # Self Intersection / Hole Tolerant only exist on the Exact solver.
+        col = layout.column()
+        col.active = self.boolean_solver == "Exact"
+        col.prop(self, "self_intersection")
+        col.prop(self, "hole_tolerant")
+
+
+# Give the boolean-capable tools their shared boolean properties. Injected here
+# (not on the mixin) so they register on each operator: Blender collects an
+# operator's own annotations, not those of a non-registered base class.
+for _cls in (View3D_OT_node_extrude, View3D_OT_node_revolve):
+    _cls.__annotations__.update(_boolean_tool_annotations())
+
+_stateops_register, _stateops_unregister = register_stateops_factory(
+    (
+        View3D_OT_node_extrude,
+        View3D_OT_node_array_linear,
+        View3D_OT_node_array_circular,
+        View3D_OT_node_revolve,
+        View3D_OT_node_boolean,
+    )
+)
+
+
+def register():
+    # BooleanTargetItem must exist before the operators' CollectionProperty binds.
+    bpy.utils.register_class(BooleanTargetItem)
+    _stateops_register()
+
+
+def unregister():
+    _stateops_unregister()
+    bpy.utils.unregister_class(BooleanTargetItem)
