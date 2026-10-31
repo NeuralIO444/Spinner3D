@@ -6,10 +6,17 @@ license.workspace = true
 rust-version.workspace = true
 
 [lib]
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [lints]
 workspace = true
 
 [dependencies]
 spinner-stroke-core = { path = "../spinner-stroke-core" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "stroke_1euro"
+harness = false
