@@ -1039,7 +1039,7 @@ struct BooleanModifierData {
   struct Collection *collection = nullptr;
   float double_threshold = 1e-6f;
   BooleanModifierOp operation = eBooleanModifierOp_Difference;
-  BooleanModifierSolver solver = eBooleanModifierSolver_Mesh_Arr;
+  BooleanModifierSolver solver = eBooleanModifierSolver_Manifold; /* SPINNER3D: Manifold default */
   BooleanModifierMaterialMode material_mode = eBooleanModifierMaterialMode_Index;
   BooleanModifierFlag flag = eBooleanModifierFlag_Object;
   BooleanModifierBMeshFlag bm_flag = {};
