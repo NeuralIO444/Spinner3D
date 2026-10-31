@@ -2,17 +2,8 @@
 use std::panic::catch_unwind;
 
 #[no_mangle]
-pub extern "C" fn spinner_pressure_eval(
-    t: f32,
-    p0: f32,
-    p1: f32,
-    p2: f32,
-    p3: f32,
-) -> f32 {
-    catch_unwind(|| {
-        spinner_pressure_core::eval(t, p0, p1, p2, p3)
-    })
-    .unwrap_or(f32::NAN)
+pub extern "C" fn spinner_pressure_eval(t: f32, p0: f32, p1: f32, p2: f32, p3: f32) -> f32 {
+    catch_unwind(|| spinner_pressure_core::eval(t, p0, p1, p2, p3)).unwrap_or(f32::NAN)
 }
 
 #[cfg(test)]

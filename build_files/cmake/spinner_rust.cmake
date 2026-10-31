@@ -24,7 +24,7 @@ FetchContent_MakeAvailable(Corrosion)
 
 corrosion_import_crate(
   MANIFEST_PATH "${CMAKE_SOURCE_DIR}/intern/rust/Cargo.toml"
-  CRATES spinner-hello spinner-stroke
+  CRATES spinner-hello spinner-stroke spinner-meshcore
   PROFILE release
 )
 
@@ -37,3 +37,10 @@ endif()
 
 # Optional: generate the C header in CI. For local builds the header is
 # checked in under intern/rust/spinner-hello/include/spinner_hello.h.
+
+if(WITH_SPINNER_RUST_MESHCORE)
+  target_compile_definitions(bf_editor_sculpt_paint PRIVATE WITH_SPINNER_RUST_MESHCORE)
+  target_link_libraries(bf_editor_sculpt_paint PRIVATE spinner-meshcore)
+  target_include_directories(bf_editor_sculpt_paint PRIVATE
+    "${CMAKE_SOURCE_DIR}/intern/rust/spinner-meshcore/include")
+endif()
