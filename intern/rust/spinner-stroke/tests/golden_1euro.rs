@@ -21,7 +21,7 @@ fn golden_matches_reference() {
             1.0, // d_cutoff
             1.0, // dt
             output.as_mut_ptr(),
-            (input.len() as u32),
+            input.len() as u32,
         )
     };
     assert_eq!(code, 0);
@@ -35,7 +35,7 @@ fn golden_matches_reference() {
             1.0,
             1.0,
             output2.as_mut_ptr(),
-            (input.len() as u32),
+            input.len() as u32,
         )
     };
     assert_eq!(code2, 0);
