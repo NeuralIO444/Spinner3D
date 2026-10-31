@@ -19,7 +19,7 @@ All crates must be compatible with GPL-3.0-or-later. Enforced by `cargo-deny` in
 | py-slvs / SolveSpace bindings | (bundled with CAD Sketcher) | GPL-3 | https://github.com/realthunder/slvs_py | Pinned wheels; do not fetch at runtime. |
 | QRemeshify | 1.1.0 (macOS) | GPL-3.0 | https://github.com/ksami/QRemeshify | Bundled under scripts/addons_core/QRemeshify/ with macOS dylibs only (liblib_quadwild.dylib, liblib_quadpatches.dylib). Expose as “Remesh: Hard-Surface Quads”. |
 | QuadWild / bi-MDF | (used by QRemeshify) | GPL-3 | https://github.com/mlivesu/QuadWild | Upstream library. |
-| Instant Meshes | (optional) | BSD | https://github.com/wjakob/instant-meshes | Optional subprocess remesh. Binary path set in Preferences. |
+| Instant Meshes | (optional, not bundled) | BSD | https://github.com/wjakob/instant-meshes | Subprocess remesh wrapper. Binary path set in Preferences. No binary shipped. |
 | Manifold | (already in Blender) | (upstream) | https://github.com/elalish/manifold | Make default boolean solver with Exact fallback. |
 
 ## Rejected for v1
