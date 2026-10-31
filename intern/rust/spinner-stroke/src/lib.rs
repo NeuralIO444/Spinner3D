@@ -11,7 +11,6 @@ pub extern "C" fn spinner_stroke_abi_version() -> u32 {
     2
 }
 
-
 #[no_mangle]
 pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
     points: *const f32,
