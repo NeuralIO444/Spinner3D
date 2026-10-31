@@ -7,6 +7,12 @@ use std::mem::{align_of, size_of};
 use std::panic::catch_unwind;
 
 #[no_mangle]
+pub extern "C" fn spinner_stroke_abi_version() -> u32 {
+    2
+}
+
+
+#[no_mangle]
 pub unsafe extern "C" fn spinner_stroke_smooth_1euro(
     points: *const f32,
     len: u32,
