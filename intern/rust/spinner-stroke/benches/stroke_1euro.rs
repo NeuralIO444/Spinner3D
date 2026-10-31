@@ -16,7 +16,10 @@ fn bench_1euro(c: &mut Criterion) {
                 black_box(n),
                 black_box(1.0),
                 black_box(0.0),
+                black_box(1.0),
+                black_box(1.0),
                 black_box(output.as_mut_ptr()),
+                black_box(n * 2),
             )
         })
     });
